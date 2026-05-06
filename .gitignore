@@ -1,0 +1,13 @@
+.cpcache/
+.clj-kondo/
+.lsp/
+.nrepl-port
+target/
+classes/
+out/
+*.log
+.DS_Store
+.internal/
+out/
+.shadow-cljs/
+node_modules/

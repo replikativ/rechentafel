@@ -1,0 +1,33 @@
+;; Cross-platform CLJS build via shadow-cljs.
+;;
+;; Local usage:
+;;   npm install                                ;; one-time
+;;   npx shadow-cljs release node-tests         ;; compile test bundle
+;;   node out/node-tests.js                     ;; run the test suite
+;;
+;;   bin/run-cljstests                          ;; both of the above
+;;
+;; CI uses the :ci build (the replikativ/clj-tools orb invokes
+;; `npx shadow-cljs compile ci`). It points at the same node-test target
+;; so cljs tests get exercised twice in CI for safety.
+;;
+;; The :node-tests build picks up every cljc test ns under
+;; test/rechentafel/ ending in `-test`, excluding the JVM-only oracle
+;; subdirectory.
+
+{:deps   {:aliases [:cljs]}
+
+ :builds {:node-tests
+          {:target    :node-test
+           :output-to "out/node-tests.js"
+           :ns-regexp "rechentafel\\.(?!oracle\\.).+-test$"}
+
+          :ci
+          {:target    :node-test
+           :output-to "out/ci-tests.js"
+           :ns-regexp "rechentafel\\.(?!oracle\\.).+-test$"}
+
+          :node-bench
+          {:target     :node-script
+           :output-to  "out/node-bench.js"
+           :main       rechentafel.bench.cljs-main/main}}}

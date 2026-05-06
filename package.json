@@ -1,0 +1,28 @@
+{
+  "name": "rechentafel",
+  "version": "0.1.0",
+  "description": "Pure-Clojure spreadsheet interpreter — formulas, dynamic arrays, LET/LAMBDA, tables, 3D refs. Cross-platform (Clojure + ClojureScript).",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/replikativ/rechentafel"
+  },
+  "scripts": {
+    "test": "bin/run-cljstests"
+  },
+  "keywords": [
+    "clojure",
+    "clojurescript",
+    "spreadsheet",
+    "excel",
+    "formula",
+    "interpreter"
+  ],
+  "author": "Christian Weilbach",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@js-joda/core": "^6.0.1"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.21"
+  }
+}
