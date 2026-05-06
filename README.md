@@ -2,6 +2,7 @@
 
 [![CircleCI](https://circleci.com/gh/replikativ/rechentafel.svg?style=shield)](https://circleci.com/gh/replikativ/rechentafel)
 [![Clojars](https://img.shields.io/clojars/v/org.replikativ/rechentafel.svg)](https://clojars.org/org.replikativ/rechentafel)
+[![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
 
 A pure-Clojure spreadsheet interpreter. Parses Excel formulas, builds a
 per-cell dependency graph, and evaluates workbooks — no Apache POI, no
