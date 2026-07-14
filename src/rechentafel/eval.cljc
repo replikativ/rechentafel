@@ -193,12 +193,24 @@
 
 (defn- sheet-idx
   "Resolve ref-node's :sheet qualifier to an integer index. Returns nil
-  for an unknown sheet name — callers treat that as #REF!. With no
-  qualifier, falls back to the current sheet."
+  for an unknown sheet name — callers treat that as #REF!.
+
+  With NO qualifier, Excel resolves the ref against the sheet that
+  CONTAINS THE FORMULA — `=SUM(B1:B2)` on Model means Model!B1:B2, never
+  Sheet1!B1:B2. `*current-cell*` carries that owning cell: it is bound
+  while a formula is analysed (`set-cell` → `collect-reads`) and while it
+  is evaluated (`recalc` → `eval-ast`), and `table-ref->range` already
+  relies on it for exactly this purpose.
+
+  `:cur-sheet` remains the fallback for evaluation with NO cell context —
+  a bare `eval-ast` from the REPL, or a UI evaluating against its active
+  sheet. Before this, `:cur-sheet` was the ONLY source, so every
+  unqualified ref in a multi-sheet workbook silently read sheet 0."
   [wb ref-node]
   (if-let [s (:sheet ref-node)]
     (get (:sheet-names wb) s)
-    (long (:cur-sheet wb 0))))
+    (long (or (:sheet functions/*current-cell*)
+              (:cur-sheet wb 0)))))
 
 (defn- ref->id [wb r]
   (when-let [s (sheet-idx wb r)]
@@ -924,7 +936,14 @@
               rc-ast  (rc/normalize ast row col)
               [wb interned] (intern-ast wb rc-ast)
               live-ast (rc/resolve-at interned row col)
-              new-reads (collect-reads wb live-ast)
+              ;; Dep EDGES must point at the sheet this formula lives on, not
+              ;; at :cur-sheet — an unqualified ref means "my sheet" (see
+              ;; `sheet-idx`). recalc binds *current-cell* for the eval side;
+              ;; this is the analysis side, and it has to agree, or the
+              ;; dirty-set would propagate along edges into the wrong sheet.
+              new-reads (binding [functions/*current-cell*
+                                  {:sheet (cell/sheet id) :row row :col col}]
+                          (collect-reads wb live-ast))
               vol?     (ast-has-volatile? interned)
               wb      (-> wb
                           (remove-reads id)
