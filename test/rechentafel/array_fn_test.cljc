@@ -291,3 +291,8 @@
     (is (= 4.0 (v wb 2 1)) "a boolean in a reference is skipped too")
     (is (= 4.0 (v wb 2 2)))
     (is (= :value (v wb 2 3)) "the same text written as an argument is #VALUE!")))
+
+(deftest index-of-a-one-row-array-counts-along-the-row
+  (is (= "b" (v (mk [0 0 "=INDEX({\"a\",\"b\",\"c\"},2)"]) 0 0)))
+  (is (= "b" (v (mk [0 0 "=INDEX({\"a\";\"b\";\"c\"},2)"]) 0 0)))
+  (is (= 3.0 (v (mk [0 0 "=INDEX({1,2;3,4},2,1)"]) 0 0))))

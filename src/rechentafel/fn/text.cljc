@@ -11,6 +11,9 @@
   numbers use Excel's default number format. `val/to-str` follows the
   same rules."
   (:require [clojure.string :as str]
+            [cljc.java-time.day-of-week :as dow]
+            [cljc.java-time.local-date-time :as ldt]
+            [rechentafel.fn.datetime :as datetime]
             [rechentafel.platform :as p]
             [rechentafel.value :as val]
             [rechentafel.functions :as f]))
@@ -558,6 +561,73 @@
                     (str "$" body)))))
              :arity [1 2])
 
+(def ^:private month-names
+  ["January" "February" "March" "April" "May" "June" "July" "August" "September"
+   "October" "November" "December"])
+
+(def ^:private day-names ["Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday" "Sunday"])
+
+(defn- date-tokens
+  "An Excel date/time format as tokens: [:lit s] or [:y n] [:m n] [:d n]
+   [:h n] [:min n] [:s n] [:ampm \"AM/PM\"|\"A/P\"]; nil when it has no date
+   or time part (a numeric format). Case-insensitive, as Excel; `[$-409]`
+   locale prefixes are dropped; \"quoted\" and \\x are literals; m is minutes
+   right after an hour or right before seconds."
+  [fmt]
+  (let [fmt (str/replace fmt #"\[\$[^\]]*\]" "")
+        n (count fmt)
+        raw (loop [i 0 out []]
+              (if (>= i n)
+                out
+                (let [c (nth fmt i) lc (str/lower-case (str c))]
+                  (cond
+                    (= c \") (let [j (or (str/index-of fmt "\"" (inc i)) n)]
+                               (recur (inc j) (conj out [:lit (subs fmt (inc i) j)])))
+                    (= c \\) (recur (+ i 2) (conj out [:lit (subs fmt (min (inc i) n) (min (+ i 2) n))]))
+                    (str/starts-with? (str/lower-case (subs fmt i)) "am/pm") (recur (+ i 5) (conj out [:ampm "AM/PM"]))
+                    (str/starts-with? (str/lower-case (subs fmt i)) "a/p") (recur (+ i 3) (conj out [:ampm "A/P"]))
+                    (#{"y" "m" "d" "h" "s"} lc)
+                    (let [j (loop [j i] (if (and (< j n) (= lc (str/lower-case (str (nth fmt j))))) (recur (inc j)) j))]
+                      (recur j (conj out [(keyword lc) (- j i)])))
+                    :else (recur (inc i) (conj out [:lit (str c)]))))))
+        fields (filterv #(#{:y :m :d :h :s} (first %)) raw)]
+    (when (seq fields)
+      ;; m after h, or before s, is minutes
+      (let [idx (vec (keep-indexed (fn [i t] (when (#{:y :m :d :h :s} (first t)) i)) raw))]
+        (reduce (fn [toks k]
+                  (let [i (nth idx k)
+                        prev (when (pos? k) (first (nth raw (nth idx (dec k)))))
+                        nxt (when (< (inc k) (count idx)) (first (nth raw (nth idx (inc k)))))]
+                    (if (and (= :m (first (nth raw i))) (or (= :h prev) (= :s nxt)))
+                      (assoc toks i [:min (second (nth raw i))])
+                      toks)))
+                raw (range (count idx)))))))
+
+(defn- pad2 [n] (if (< n 10) (str "0" n) (str n)))
+
+(defn- format-date
+  "Serial number `x` in the tokens of `date-tokens`."
+  [x toks]
+  (let [dt (datetime/serial->datetime x)
+        h24 (ldt/get-hour dt)
+        ampm? (some #(= :ampm (first %)) toks)
+        h (if ampm? (let [h (mod h24 12)] (if (zero? h) 12 h)) h24)]
+    (apply str
+           (for [[k v] toks]
+             (case k
+               :lit v
+               :y (let [y (ldt/get-year dt)] (if (<= v 2) (pad2 (mod y 100)) (str y)))
+               :m (let [m (ldt/get-month-value dt)]
+                    (case v 1 (str m) 2 (pad2 m) 3 (subs (month-names (dec m)) 0 3)
+                          5 (subs (month-names (dec m)) 0 1) (month-names (dec m))))
+               :d (let [d (ldt/get-day-of-month dt)
+                        wd (day-names (dec (dow/get-value (ldt/get-day-of-week dt))))]
+                    (case v 1 (str d) 2 (pad2 d) 3 (subs wd 0 3) wd))
+               :h (if (>= v 2) (pad2 h) (str h))
+               :min (let [m (ldt/get-minute dt)] (if (>= v 2) (pad2 m) (str m)))
+               :s (let [s (ldt/get-second dt)] (if (>= v 2) (pad2 s) (str s)))
+               :ampm (if (= "AM/PM" v) (if (< h24 12) "AM" "PM") (if (< h24 12) "A" "P")))))))
+
 (f/register! "TEXT"
   ;; Numeric/text formatter — full Excel format codes are massive. Start
   ;; with the pieces POI's TextFunction.TEXT actually delegates:
@@ -566,7 +636,8 @@
   ;;   ,           thousands separator
   ;;   %           percentage (multiply by 100)
   ;;   @           literal text of the arg
-  ;; More (dates, custom) can be layered later.
+  ;; and date/time codes (see `date-tokens`): TEXT(DATE(2020,5,1),"mmmm")
+  ;; is "May".
              ^{:scalar? true}
              (fn [args]
                (let [v   (nth args 0)
@@ -578,16 +649,20 @@
                        (val/err? x) (f/domain-error! (:v x))
                        (not (val/num? x)) (f/domain-error! :value)
                        :else
-                       (let [n (double (:v x))
-                             pct? (str/includes? fmt "%")
-                             scaled (if pct? (* n 100.0) n)
-                             decimals (let [parts (str/split fmt #"\." 2)]
-                                        (if (= 2 (count parts))
-                                          (count (re-seq #"[0#]" (second parts)))
-                                          0))
-                             grouped? (boolean (re-find #"[0#],[0#]" fmt))
-                             body (format-fixed scaled decimals grouped?)]
-                         (val/string (if pct? (str body "%") body))))))))
+                       (if-let [toks (and (not (re-find #"(?i)^general$" fmt)) (date-tokens fmt))]
+                         (if (neg? (double (:v x)))
+                           (f/domain-error! :value)
+                           (val/string (format-date (double (:v x)) toks)))
+                         (let [n (double (:v x))
+                               pct? (str/includes? fmt "%")
+                               scaled (if pct? (* n 100.0) n)
+                               decimals (let [parts (str/split fmt #"\." 2)]
+                                          (if (= 2 (count parts))
+                                            (count (re-seq #"[0#]" (second parts)))
+                                            0))
+                               grouped? (boolean (re-find #"[0#],[0#]" fmt))
+                               body (format-fixed scaled decimals grouped?)]
+                           (val/string (if pct? (str body "%") body)))))))))
              :arity [2 2])
 
 ;; ---------------------------------------------------------------------------

@@ -50,7 +50,9 @@
       (ld/plus-days (epoch-pre-leap) n)
       (ld/plus-days (epoch-normal) n))))
 
-(defn- serial->datetime [serial]
+(defn serial->datetime
+  "An Excel serial number (1900 system) as a local date-time."
+  [serial]
   (let [d   (serial->date serial)
         frac (- (double serial) (Math/floor (double serial)))
         ;; total seconds in the day; round to avoid accumulating error
