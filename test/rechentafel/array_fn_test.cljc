@@ -280,3 +280,14 @@
   (is (= 10.0 (eval1 "=LARGE(B1:B3,3)")))
   (is (= "y" (eval1 "=INDEX(A1:A3,SMALL(IF(B1:B3>15,ROW(B1:B3)),1))"))
       "the INDEX/SMALL/IF/ROW idiom for the first match"))
+
+(deftest unary-plus-is-a-no-op
+  (is (= "Date" (v (mk [0 0 "Date"] [1 1 "=+A1"]) 1 1)) "text included"))
+
+(deftest aggregates-skip-text-in-a-referenced-cell
+  (let [wb (mk [0 0 "x"] [0 1 4] [0 2 true] [2 0 "=MAX(A1,B1)"] [2 1 "=SUM(A1,B1,C1)"]
+               [2 2 "=MIN(A1,B1)"] [2 3 "=MAX(\"x\",4)"])]
+    (is (= 4.0 (v wb 2 0)))
+    (is (= 4.0 (v wb 2 1)) "a boolean in a reference is skipped too")
+    (is (= 4.0 (v wb 2 2)))
+    (is (= :value (v wb 2 3)) "the same text written as an argument is #VALUE!")))

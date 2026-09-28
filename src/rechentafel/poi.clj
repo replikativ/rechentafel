@@ -117,21 +117,31 @@
         (recur (inc si) wb')))))
 
 (defn- load-defined-names
-  "Workbook-level defined names: name → formula. Sheet-scoped names are
-  ignored for now — `eval/define-name` only supports a single global
-  scope. Names with built-in roles (`_xlnm.Print_Area` etc.) are
-  skipped because their semantics aren't formula-evaluation."
+  "Defined names: name → formula. Workbook-level names first; a
+  sheet-scoped name is then loaded as a global one when no other name has
+  that name (the common case: a name local to the one sheet using it).
+  `eval/define-name` has a single global scope, so a name defined on
+  several sheets is ambiguous and skipped. Names with built-in roles
+  (`_xlnm.Print_Area` etc.) are skipped because their semantics aren't
+  formula-evaluation."
   [wb ^Workbook poi]
-  (let [names (for [^Name nm (.getAllNames poi)
-                    :when (and (not (.isHidden nm))
-                               (not (.isFunctionName nm))
-                               (not (.startsWith ^String (.getNameName nm)
-                                                 "_xlnm.")))]
-                [(.getNameName nm) (.getRefersToFormula nm)])]
-    (reduce (fn [wb [nm formula]]
-              (try (e/define-name wb nm (str "=" formula))
+  (let [usable (for [^Name nm (.getAllNames poi)
+                     :when (and (not (.isHidden nm))
+                                (not (.isFunctionName nm))
+                                (not (.startsWith ^String (.getNameName nm) "_xlnm.")))]
+                 {:name (.getNameName nm) :formula (.getRefersToFormula nm)
+                  :global? (neg? (.getSheetIndex nm))})
+        by-name (group-by #(clojure.string/upper-case (:name %)) usable)
+        chosen (keep (fn [[_ ns]]
+                       (let [globals (filter :global? ns)]
+                         (cond
+                           (seq globals) (first globals)
+                           (= 1 (count ns)) (first ns))))
+                     by-name)]
+    (reduce (fn [wb {:keys [name formula]}]
+              (try (e/define-name wb name (str "=" formula))
                    (catch Throwable _ wb)))    ;; skip names we can't parse
-            wb names)))
+            wb chosen)))
 
 (defn load-workbook
   "Read `path` with Apache POI and return a recalculated spread workbook.

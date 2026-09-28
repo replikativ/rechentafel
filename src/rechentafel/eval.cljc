@@ -722,7 +722,19 @@
       reg
       (if (:lazy? reg)
         (functions/call-lazy (lazy-ctx wb env) fname (:args ast))
-        (functions/call fname (mapv #(eval-ast wb env %) (:args ast))))
+        (functions/call fname
+                        (mapv (fn [a]
+                                (let [v (eval-ast wb env a)]
+                                  ;; an aggregate sees a one-cell reference as the
+                                  ;; reference it is: text or a boolean in it is
+                                  ;; skipped as in any range, where the same text
+                                  ;; written as an argument is #VALUE!
+                                  (if (and (= :ref (:op a))
+                                           (contains? functions/reference-aggregates up)
+                                           (not (val/area? v)))
+                                    {:t :area :r0 0 :c0 0 :r1 0 :c1 0 :values [[v]]}
+                                    v)))
+                              (:args ast))))
 
       ;; Bound via LET / non-lambda defined name — calling a value that
       ;; isn't a lambda is #VALUE!.  Otherwise the name is unknown.
@@ -757,7 +769,9 @@
                      (val/err? v) v
                      :else (case (:sym ast)
                              :minus (val/number (- (functions/num! v)))
-                             :plus  (val/to-num v))))
+                             ;; Excel's unary plus is a no-op, text included
+                             ;; (=+A1 on "Date" is "Date")
+                             :plus  v)))
                  [a]))
      :postop  (let [a (eval-ast wb env (:arg ast))]
                 (functions/lift-call
