@@ -70,10 +70,18 @@
              array?    (assoc :array? true)))
     k))
 
-(defn lookup
-  "Returns the registration map for `fname`, or nil. Case-insensitive."
+(defn canonical-name
+  "`fname` upper-cased and without the storage prefixes Excel writes for
+   functions newer than 2007 (`_xlfn.IFNA`, `_xlfn._xlws.FILTER`,
+   `_xlfn.STDEV.S`): the name as it is registered."
   [fname]
-  (get @*registry (str/upper-case (name fname))))
+  (str/replace (str/upper-case (name fname)) #"^(_XLFN\.)?(_XLWS\.)?" ""))
+
+(defn lookup
+  "Returns the registration map for `fname`, or nil. Case-insensitive; a
+   name as stored in a file (`_xlfn.` prefix) finds its function."
+  [fname]
+  (get @*registry (canonical-name fname)))
 
 (defn registered-names
   "All registered function names, sorted."
@@ -431,6 +439,15 @@
     :ref  (walk-scalars (:resolved v val/BLANK) f in-area?)
     (f v in-area?)))
 
+(def reference-aggregates
+  "Functions that treat a reference argument as a range: text and booleans
+   in a referenced cell are skipped, even a single cell (Excel: MAX(A1,B1)
+   with text in A1 is B1; MAX(\"x\",4) is #VALUE!). The evaluator passes such
+   a one-cell reference to these as a 1x1 area."
+  #{"SUM" "PRODUCT" "MAX" "MIN" "AVERAGE" "MEDIAN" "COUNT" "SUMSQ" "DEVSQ" "AVEDEV"
+    "GEOMEAN" "HARMEAN" "MODE" "MODE.SNGL" "STDEV" "STDEV.S" "STDEV.P" "STDEVP"
+    "VAR" "VAR.S" "VAR.P" "VARP"})
+
 (defn each-scalar
   "Invoke (f scalar in-area?) for every scalar in `args`. `in-area?` is
   true when the scalar was expanded out of an area/range, false when it
@@ -442,9 +459,9 @@
 
 (defn sum-numeric
   "Sum the numeric scalars in `args` as a double. POI's AggregateFunction
-  semantics: strings inside an area are silently skipped; strings at the
-  top level coerce or raise #VALUE!; blanks are skipped; booleans count
-  (TRUE=1, FALSE=0); errors propagate as domain errors."
+  semantics: strings and booleans inside an area are silently skipped;
+  strings at the top level coerce or raise #VALUE!, booleans there count
+  (TRUE=1, FALSE=0); blanks are skipped; errors propagate as domain errors."
   ^double [args]
   (let [acc (volatile! 0.0)]
     (each-scalar
@@ -453,7 +470,9 @@
        (case (:t v)
          :num   (vswap! acc #(+ (double %) (double (:v v))))
          :blank nil
-         :bool  (vswap! acc #(+ (double %) (if (:v v) 1.0 0.0)))
+         ;; a boolean written as an argument counts; one in a reference or
+         ;; range is skipped (Excel, POI)
+         :bool  (when-not in-area? (vswap! acc #(+ (double %) (if (:v v) 1.0 0.0))))
          :str   (when-not in-area?
                   (if-let [n (parse-num-str (:v v))]
                     (vswap! acc #(+ (double %) (double n)))

@@ -131,37 +131,58 @@
              (fn [args] (val/number (double (second (dims (first args))))))
              :arity [1 1])
 
+(defn- ref-bounds
+  "`[r0 c0 r1 c1]` (0-based) of what a ROW/COLUMN argument refers to: a
+   :ref or :range node read without evaluating the cells, or any other
+   expression (e.g. INDIRECT) evaluated to the area or reference it yields."
+  [ctx a]
+  (case (:op a)
+    :ref [(:row a) (:col a) (:row a) (:col a)]
+    :range (let [l (:left a) r (:right a)]
+             [(min (:row l) (:row r)) (min (:col l) (:col r))
+              (max (:row l) (:row r)) (max (:col l) (:col r))])
+    (when-let [ev (:eval ctx)]
+      (let [v (ev ctx a)]
+        (cond
+          (val/area? v) [(:ref-r0 v (:r0 v)) (:ref-c0 v (:c0 v))
+                         (:ref-r1 v (:r1 v)) (:ref-c1 v (:c1 v))]
+          (val/ref? v) [(:row v) (:col v) (:row v) (:col v)])))))
+
+(defn- numbers-area
+  "A rows x cols area of (f r c) numbers; a 1x1 one is its number."
+  [rows cols f]
+  (if (= 1 rows cols)
+    (val/number (double (f 0 0)))
+    {:t :area :r0 0 :c0 0 :r1 (dec rows) :c1 (dec cols)
+     :values (vec (for [r (range rows)] (vec (for [c (range cols)] (val/number (double (f r c)))))))}))
+
 (f/register! "ROW"
   ;; Lazy: inspect the AST arg so we can read the row of a :ref/:range
   ;; node without evaluating the cell (whose value would strip ref-ness).
   ;; With no arg and an evaluator ctx that exposes :current-cell, use that.
+  ;; A multi-row range gives the column of its row numbers, as in Excel
+  ;; (ROW(A1:A3) = {1;2;3}).
              (fn [ctx ast-args]
-               (cond
-                 (empty? ast-args)
+               (if (empty? ast-args)
                  (if-let [cur (:current-cell ctx)]
                    (val/number (double (inc (long (:row cur)))))
                    val/ERR-VALUE)
-                 :else
-                 (let [a (first ast-args)]
-                   (case (:op a)
-                     :ref   (val/number (double (inc (long (:row a)))))
-                     :range (val/number (double (inc (long (:row (:left a))))))
-                     val/ERR-VALUE))))
+                 (if-let [[r0 _ r1 _] (ref-bounds ctx (first ast-args))]
+                   (numbers-area (inc (- (long r1) (long r0))) 1 (fn [r _] (+ (long r0) r 1)))
+                   val/ERR-VALUE)))
              :arity [0 1] :lazy? true)
 
 (f/register! "COLUMN"
+  ;; A multi-column range gives the row of its column numbers
+  ;; (COLUMN(A1:C1) = {1,2,3}).
              (fn [ctx ast-args]
-               (cond
-                 (empty? ast-args)
+               (if (empty? ast-args)
                  (if-let [cur (:current-cell ctx)]
                    (val/number (double (inc (long (:col cur)))))
                    val/ERR-VALUE)
-                 :else
-                 (let [a (first ast-args)]
-                   (case (:op a)
-                     :ref   (val/number (double (inc (long (:col a)))))
-                     :range (val/number (double (inc (long (:col (:left a))))))
-                     val/ERR-VALUE))))
+                 (if-let [[_ c0 _ c1] (ref-bounds ctx (first ast-args))]
+                   (numbers-area 1 (inc (- (long c1) (long c0))) (fn [_ c] (+ (long c0) c 1)))
+                   val/ERR-VALUE)))
              :arity [0 1] :lazy? true)
 
 (f/register! "AREAS"

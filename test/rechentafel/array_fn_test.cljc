@@ -250,3 +250,54 @@
                [5 1 "=FORMULATEXT(B5)"])]
     (is (= "=SEQUENCE(3)" (:v (at wb 4 0))))
     (is (= "=BYROW({1,2;3,4},LAMBDA(r,SUM(r)))" (:v (at wb 5 1))))))
+
+;; ---------------------------------------------------------------------------
+;; Legacy array formulas in real workbooks (found by the SpreadsheetBench
+;; conformance check, dev/spreadsheetbench_coverage.clj)
+
+(def ^:private data
+  ;; A1:A3 names, B1:B3 values, A5:C5 / A6:C6 two rows to compare
+  [[0 0 "x"] [1 0 "y"] [2 0 "z"] [0 1 10] [1 1 20] [2 1 30]
+   [4 0 1] [4 1 2] [4 2 3] [5 0 1] [5 1 5] [5 2 3]])
+
+(defn- eval1 [formula]
+  (v (apply mk (conj data [9 9 formula])) 9 9))
+
+(deftest if-with-an-array-condition-is-element-wise
+  (is (= 2.0 (eval1 "=SUM(IF(A5:C5=A6:C6,1,0))")) "both branches, one element each")
+  (is (= 3.0 (eval1 "=MAX(IF(A5:C5<>2,A5:C5))")) "FALSE elements are ignored by MAX")
+  (is (= 60.0 (eval1 "=SUM(IFERROR(B1:B3/1,0))")) "IFERROR too")
+  (is (= "y" (eval1 "=IF(B2>15,\"y\",\"n\")")) "a scalar condition still picks one branch"))
+
+(deftest row-and-column-of-a-range-are-arrays
+  (is (= 9.0 (eval1 "=SUM(ROW(A2:A4))")))
+  (is (= 9.0 (eval1 "=SUM(COLUMN(B1:D1))")))
+  (is (= 5.0 (eval1 "=ROW(C5)")) "a single cell is a number")
+  (is (= 6.0 (eval1 "=SUM(ROW(INDIRECT(\"1:3\")))")) "a computed reference too"))
+
+(deftest small-and-large-do-not-count-k-as-data
+  (is (= 10.0 (eval1 "=SMALL(B1:B3,1)")) "k = 1 is below every value")
+  (is (= 10.0 (eval1 "=LARGE(B1:B3,3)")))
+  (is (= "y" (eval1 "=INDEX(A1:A3,SMALL(IF(B1:B3>15,ROW(B1:B3)),1))"))
+      "the INDEX/SMALL/IF/ROW idiom for the first match"))
+
+(deftest unary-plus-is-a-no-op
+  (is (= "Date" (v (mk [0 0 "Date"] [1 1 "=+A1"]) 1 1)) "text included"))
+
+(deftest aggregates-skip-text-in-a-referenced-cell
+  (let [wb (mk [0 0 "x"] [0 1 4] [0 2 true] [2 0 "=MAX(A1,B1)"] [2 1 "=SUM(A1,B1,C1)"]
+               [2 2 "=MIN(A1,B1)"] [2 3 "=MAX(\"x\",4)"])]
+    (is (= 4.0 (v wb 2 0)))
+    (is (= 4.0 (v wb 2 1)) "a boolean in a reference is skipped too")
+    (is (= 4.0 (v wb 2 2)))
+    (is (= :value (v wb 2 3)) "the same text written as an argument is #VALUE!")))
+
+(deftest index-of-a-one-row-array-counts-along-the-row
+  (is (= "b" (v (mk [0 0 "=INDEX({\"a\",\"b\",\"c\"},2)"]) 0 0)))
+  (is (= "b" (v (mk [0 0 "=INDEX({\"a\";\"b\";\"c\"},2)"]) 0 0)))
+  (is (= 3.0 (v (mk [0 0 "=INDEX({1,2;3,4},2,1)"]) 0 0))))
+
+(deftest functions-as-files-store-them
+  ;; Excel writes functions newer than 2007 with storage prefixes
+  (is (= 1.0 (v (mk [0 0 "=_xlfn.IFNA(NA(),1)"]) 0 0)))
+  (is (= 5.0 (v (mk [0 0 1] [1 0 2] [2 0 3] [3 0 "=SUM(_xlfn._xlws.FILTER(A1:A3,A1:A3>1))"]) 3 0))))

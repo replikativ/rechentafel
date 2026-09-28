@@ -212,9 +212,15 @@
              (fn [args]
                (let [arr (nth args 0)
                      rows (area-rows arr)
-                     rn (long (f/num! (nth args 1)))
-                     cn (if (> (count args) 2) (long (f/num! (nth args 2))) 1)
-                     [nrows ncols] [(count rows) (count (first rows))]]
+                     [nrows ncols] [(count rows) (count (first rows))]
+                     ;; one index into a one-row array counts along the row
+                     ;; (INDEX({"a","b","c"},2) is "b"), as in Excel
+                     along-row? (and (= 2 (count args)) (= 1 nrows) (> ncols 1))
+                     given (long (f/num! (nth args 1)))
+                     rn (if along-row? 1 given)
+                     cn (cond along-row? given
+                              (> (count args) 2) (long (f/num! (nth args 2)))
+                              :else 1)]
                  (when (or (neg? rn) (> rn nrows)) (f/domain-error! :ref))
                  (when (or (neg? cn) (> cn ncols)) (f/domain-error! :ref))
                  (cond

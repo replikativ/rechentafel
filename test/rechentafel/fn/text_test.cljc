@@ -122,3 +122,13 @@
   (is (= (s "($1,234.50)") (f/call "DOLLAR" [(n -1234.5)])))
   (is (= (s "25%") (f/call "TEXT" [(n 0.25) (s "0%")])))
   (is (= (s "hello") (f/call "TEXT" [(s "hello") (s "@")]))))
+
+(deftest text-formats-dates-and-times
+  ;; 43952 = 2020-05-01, 45296 = 2024-01-05 (a Friday), .75 = 18:00
+  (is (= (s "May") (f/call "TEXT" [(n 43952) (s "mmmm")])))
+  (is (= (s "Jan 24") (f/call "TEXT" [(n 45296) (s "MMM YY")])) "codes are case-insensitive")
+  (is (= (s "05/01/2024") (f/call "TEXT" [(n 45296) (s "dd/mm/yyyy")])))
+  (is (= (s "Friday") (f/call "TEXT" [(n 45296) (s "dddd")])))
+  (is (= (s "6:00 PM") (f/call "TEXT" [(n 45296.75) (s "h:mm AM/PM")])) "m after h is minutes")
+  (is (= (s "9-Mar") (f/call "TEXT" [(n 45360) (s "[$-409]d-mmm")])) "a locale prefix is dropped")
+  (is (= (s "1,234.50") (f/call "TEXT" [(n 1234.5) (s "#,##0.00")])) "numeric formats as before"))
