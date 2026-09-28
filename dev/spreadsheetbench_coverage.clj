@@ -31,12 +31,12 @@
     ;; no <v> element: nothing was saved (POI would report numeric 0)
     (when (or (not (instance? org.apache.poi.xssf.usermodel.XSSFCell c))
               (.isSetV (.getCTCell ^org.apache.poi.xssf.usermodel.XSSFCell c)))
-    (condp = (.getCachedFormulaResultType c)
-      CellType/NUMERIC {:t :num :v (.getNumericCellValue c)}
-      CellType/STRING (let [s (.getStringCellValue c)] {:t :str :v s})
-      CellType/BOOLEAN {:t :bool :v (.getBooleanCellValue c)}
-      CellType/ERROR {:t :err :v (.getString (FormulaError/forInt (.getErrorCellValue c)))}
-      nil))
+      (condp = (.getCachedFormulaResultType c)
+        CellType/NUMERIC {:t :num :v (.getNumericCellValue c)}
+        CellType/STRING (let [s (.getStringCellValue c)] {:t :str :v s})
+        CellType/BOOLEAN {:t :bool :v (.getBooleanCellValue c)}
+        CellType/ERROR {:t :err :v (.getString (FormulaError/forInt (.getErrorCellValue c)))}
+        nil))
     (catch Exception _ nil)))
 
 (defn- ours [v]
@@ -95,11 +95,11 @@
           {:file (.getName f)
            :unparsed (:load-errors wb)
            :compared (count (filter some? (for [si (range (.getNumberOfSheets p))
-                                                  :let [^Sheet sh (.getSheetAt p si)]
-                                                  ^Row r (iterator-seq (.iterator sh))
-                                                  ^Cell c (iterator-seq (.iterator r))
-                                                  :when (= CellType/FORMULA (.getCellType c))]
-                                              (saved-value c))))
+                                                :let [^Sheet sh (.getSheetAt p si)]
+                                                ^Row r (iterator-seq (.iterator sh))
+                                                ^Cell c (iterator-seq (.iterator r))
+                                                :when (= CellType/FORMULA (.getCellType c))]
+                                            (saved-value c))))
            :mismatches (vec (remove nil? rows))})))
     (catch Throwable t
       {:file (.getName f) :error (str (.getSimpleName (class t)) ": " (ex-message t))})))
