@@ -95,35 +95,49 @@
     ;; fallback for tests: treat ast as an already-evaluated value
     ast))
 
+(defn- pick-if
+  "One element of an array IF: the condition's error, else then or else."
+  [[c t e]]
+  (cond (val/err? c) c
+        (val/truthy? c) t
+        :else e))
+
 (f/register! "IF"
+             ;; A scalar condition picks one branch and evaluates only that.
+             ;; An array condition (IF(A1:C1=A2:C2, ...)) is element-wise, as
+             ;; in Excel: both branches are evaluated and each element takes
+             ;; its own, scalars broadcast.
              (fn [ctx ast-args]
-               (let [cond-v (eval1 ctx (nth ast-args 0))]
+               (let [cond-v (eval1 ctx (nth ast-args 0))
+                     then-v #(if (>= (count ast-args) 2) (eval1 ctx (nth ast-args 1)) val/TRUE)
+                     else-v #(if (>= (count ast-args) 3) (eval1 ctx (nth ast-args 2)) val/FALSE)]
                  (cond
+                   (f/area? cond-v) (f/lift-call pick-if [cond-v (then-v) (else-v)])
                    (val/err? cond-v) cond-v
-                   (val/truthy? cond-v)
-                   (if (>= (count ast-args) 2)
-                     (eval1 ctx (nth ast-args 1))
-                     val/TRUE)
-                   :else
-                   (if (>= (count ast-args) 3)
-                     (eval1 ctx (nth ast-args 2))
-                     val/FALSE))))
+                   (val/truthy? cond-v) (then-v)
+                   :else (else-v))))
              :arity [2 3] :lazy? true)
 
 (f/register! "IFERROR"
+             ;; element-wise over an array value, as IF
              (fn [ctx ast-args]
                (let [v (eval1 ctx (nth ast-args 0))]
-                 (if (val/err? v)
-                   (eval1 ctx (nth ast-args 1))
-                   v)))
+                 (cond
+                   (f/area? v) (f/lift-call (fn [[x alt]] (if (val/err? x) alt x))
+                                            [v (eval1 ctx (nth ast-args 1))])
+                   (val/err? v) (eval1 ctx (nth ast-args 1))
+                   :else v)))
              :arity [2 2] :lazy? true)
 
 (f/register! "IFNA"
              (fn [ctx ast-args]
-               (let [v (eval1 ctx (nth ast-args 0))]
-                 (if (and (val/err? v) (= :na (:v v)))
-                   (eval1 ctx (nth ast-args 1))
-                   v)))
+               (let [v (eval1 ctx (nth ast-args 0))
+                     na? #(and (val/err? %) (= :na (:v %)))]
+                 (cond
+                   (f/area? v) (f/lift-call (fn [[x alt]] (if (na? x) alt x))
+                                            [v (eval1 ctx (nth ast-args 1))])
+                   (na? v) (eval1 ctx (nth ast-args 1))
+                   :else v)))
              :arity [2 2] :lazy? true)
 
 (f/register! "IFS"

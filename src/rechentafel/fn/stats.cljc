@@ -222,8 +222,9 @@
 ;; LARGE / SMALL
 
 (f/register! "LARGE"
+             ;; the data is the first argument only: k is not a data point
              (fn [args]
-               (let [xs (vec (sort > (f/collect-finite-numerics args)))
+               (let [xs (vec (sort > (f/collect-finite-numerics [(first args)])))
                      k  (long (f/num! (nth args 1)))]
                  (if (or (<= k 0) (> k (count xs)))
                    val/ERR-NUM
@@ -232,7 +233,7 @@
 
 (f/register! "SMALL"
              (fn [args]
-               (let [xs (vec (sort (f/collect-finite-numerics args)))
+               (let [xs (vec (sort (f/collect-finite-numerics [(first args)])))
                      k  (long (f/num! (nth args 1)))]
                  (if (or (<= k 0) (> k (count xs)))
                    val/ERR-NUM
