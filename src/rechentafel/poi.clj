@@ -29,7 +29,8 @@
     ;; an empty formula (some writers leave one) is a blank cell
     CellType/FORMULA (let [f (.getCellFormula c)] (when-not (clojure.string/blank? f) (str "=" f)))
     CellType/NUMERIC (.getNumericCellValue c)
-    CellType/STRING  (.getStringCellValue c)
+    ;; tagged, so text such as "=====" is text, not a formula
+    CellType/STRING  {:t :str :v (.getStringCellValue c)}
     CellType/BOOLEAN (.getBooleanCellValue c)
     CellType/BLANK   nil
     CellType/ERROR   nil
