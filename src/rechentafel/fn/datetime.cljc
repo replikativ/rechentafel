@@ -189,6 +189,9 @@
                                 1 (inc (mod dow-val 7))   ;; Sun=1
                                 2 dow-val
                                 3 (dec dow-val)
+                                ;; 11..17 (Excel 2010): the week starts on
+                                ;; Monday (11) .. Sunday (17), which is 1
+                                (11 12 13 14 15 16 17) (inc (mod (- dow-val (- t 10)) 7))
                                 (f/domain-error! :num))]
                    (val/number (double result))))
                {:scalar? true})

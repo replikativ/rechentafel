@@ -63,3 +63,12 @@
     (is (= (n 53) (f/call "ISOWEEKNUM" [(n (d 2020 12 31))])))
     ;; 2025-04-17 is Thu of week 16
     (is (= (n 16) (f/call "ISOWEEKNUM" [(n (d 2025 4 17))])))))
+
+(deftest weekday-return-types-11-to-17
+  ;; 43922 = 2020-04-01, a Wednesday; type 11 starts the week on Monday,
+  ;; ... 17 on Sunday
+  (is (= (n 3) (f/call "WEEKDAY" [(n 43922) (n 11)])))
+  (is (= (n 2) (f/call "WEEKDAY" [(n 43922) (n 12)])))
+  (is (= (n 1) (f/call "WEEKDAY" [(n 43922) (n 13)])))
+  (is (= (n 4) (f/call "WEEKDAY" [(n 43922) (n 17)])) "17 = 1 (Sunday start)")
+  (is (= (n 4) (f/call "WEEKDAY" [(n 43922) (n 1)]))))
