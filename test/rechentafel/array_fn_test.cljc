@@ -296,3 +296,8 @@
   (is (= "b" (v (mk [0 0 "=INDEX({\"a\",\"b\",\"c\"},2)"]) 0 0)))
   (is (= "b" (v (mk [0 0 "=INDEX({\"a\";\"b\";\"c\"},2)"]) 0 0)))
   (is (= 3.0 (v (mk [0 0 "=INDEX({1,2;3,4},2,1)"]) 0 0))))
+
+(deftest functions-as-files-store-them
+  ;; Excel writes functions newer than 2007 with storage prefixes
+  (is (= 1.0 (v (mk [0 0 "=_xlfn.IFNA(NA(),1)"]) 0 0)))
+  (is (= 5.0 (v (mk [0 0 1] [1 0 2] [2 0 3] [3 0 "=SUM(_xlfn._xlws.FILTER(A1:A3,A1:A3>1))"]) 3 0))))

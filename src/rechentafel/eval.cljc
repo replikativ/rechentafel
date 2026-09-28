@@ -702,7 +702,7 @@
 
 (defn- eval-call [wb env ast]
   (let [fname  (:name ast)
-        up     (str/upper-case fname)
+        up     (functions/canonical-name fname)
         ;; Excel resolves defined names BEFORE the function table —
         ;; `SUM = LAMBDA(...)` shadows the builtin SUM. We follow that
         ;; rule, but only when the resolved binding is actually a

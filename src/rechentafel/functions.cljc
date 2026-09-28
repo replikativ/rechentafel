@@ -70,10 +70,18 @@
              array?    (assoc :array? true)))
     k))
 
-(defn lookup
-  "Returns the registration map for `fname`, or nil. Case-insensitive."
+(defn canonical-name
+  "`fname` upper-cased and without the storage prefixes Excel writes for
+   functions newer than 2007 (`_xlfn.IFNA`, `_xlfn._xlws.FILTER`,
+   `_xlfn.STDEV.S`): the name as it is registered."
   [fname]
-  (get @*registry (str/upper-case (name fname))))
+  (str/replace (str/upper-case (name fname)) #"^(_XLFN\.)?(_XLWS\.)?" ""))
+
+(defn lookup
+  "Returns the registration map for `fname`, or nil. Case-insensitive; a
+   name as stored in a file (`_xlfn.` prefix) finds its function."
+  [fname]
+  (get @*registry (canonical-name fname)))
 
 (defn registered-names
   "All registered function names, sorted."
