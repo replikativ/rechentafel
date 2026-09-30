@@ -13,4 +13,5 @@
             [rechentafel.fn.stats]
             [rechentafel.fn.financial]
             [rechentafel.fn.misc]
-            [rechentafel.fn.array]))
+            [rechentafel.fn.array]
+            [rechentafel.fn.xml]))
