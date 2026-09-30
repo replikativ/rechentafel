@@ -26,7 +26,8 @@
             [cljc.java-time.temporal.iso-fields :as iso-fields]
             [cljc.java-time.format.date-time-formatter :as dtf]
             [rechentafel.value :as val]
-            [rechentafel.functions :as f]))
+            [rechentafel.functions :as f]
+            [rechentafel.datetext :as datetext]))
 
 ;; ---------------------------------------------------------------------------
 ;; Serial ↔ date conversions
@@ -141,19 +142,22 @@
                        cleaned (str/trim s)]
                    (if-let [date (try-parse-date cleaned)]
                      (val/number (date->serial date))
-                     (f/domain-error! :value))))
+                     ;; the forms Excel also reads (1Oct21, Jan 2024, …): the
+                     ;; date part only
+                     (if-let [serial (datetext/parse cleaned)]
+                       (val/number (Math/floor serial))
+                       (f/domain-error! :value)))))
                {:scalar? true})
              :arity [1 1])
 
 (f/register! "TIMEVALUE"
              (with-meta
                (fn [args]
-                 (let [s (f/str! (nth args 0))
-                       t (try (lt/parse s)
-                              (catch #?(:clj Throwable :cljs :default) _
-                                (f/domain-error! :value)))
-                       secs (lt/to-second-of-day t)]
-                   (val/number (/ (double secs) 86400.0))))
+                 (let [s (f/str! (nth args 0))]
+                   ;; the time of day of text Excel reads as a time
+                   (if-let [serial (datetext/parse s)]
+                     (val/number (- serial (Math/floor serial)))
+                     (f/domain-error! :value))))
                {:scalar? true})
              :arity [1 1])
 

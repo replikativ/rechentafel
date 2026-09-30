@@ -42,19 +42,30 @@
     ast))
 
 (defn- pred
-  "Install a 1-arg lazy predicate — `:lazy?` lets us see errors as values."
-  [name p]
-  (f/register! name
-               (fn [ctx ast-args]
-                 (val/boolean-v (p (eval1 ctx (first ast-args)))))
-               :arity [1 1] :lazy? true))
+  "Install a 1-arg lazy predicate — `:lazy?` lets us see errors as values.
+  Over an array (a range, an array expression) it answers per element, as
+  Excel does (ISNUMBER(SEARCH(x, A1:A9)) is an array); with `whole?` the
+  value is tested as it is (ISREF: a range is a reference)."
+  ([name p] (pred name p false))
+  ([name p whole?]
+   (let [test (fn [v] (try (val/boolean-v (p v))
+                           (catch #?(:clj Exception :cljs :default) e
+                             (if-let [code (:excel-error (ex-data e))] (val/error code) (throw e)))))]
+     (f/register! name
+                  (fn [ctx ast-args]
+                    (let [v (eval1 ctx (first ast-args))]
+                      (if (and (not whole?) (f/area? v))
+                        (-> (dissoc v :sheet :ref-r0 :ref-r1 :ref-c0 :ref-c1)
+                            (update :values (fn [rows] (mapv #(mapv test %) rows))))
+                        (val/boolean-v (p v)))))
+                  :arity [1 1] :lazy? true))))
 
 (pred "ISBLANK"   val/blank?)
 (pred "ISNUMBER"  val/num?)
 (pred "ISTEXT"    val/str?)
 (pred "ISNONTEXT" (complement val/str?))
 (pred "ISLOGICAL" val/bool?)
-(pred "ISREF"     val/ref?)
+(pred "ISREF"     #(or (val/ref? %) (and (f/area? %) (some? (:sheet %))) (some? (:ref %))) true)
 (pred "ISERROR"   val/err?)
 (pred "ISERR"     (fn [v] (and (val/err? v) (not= :na (:v v)))))
 (pred "ISNA"      (fn [v] (and (val/err? v) (= :na (:v v)))))

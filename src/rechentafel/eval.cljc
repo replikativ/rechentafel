@@ -406,8 +406,12 @@
      :err    acc
      :missing acc
      :ref    (if-let [r (ref->range wb ast)] (conj! acc r) acc)
-     :range  (if-let [r (pair->range wb (:left ast) (:right ast))]
-               (conj! acc r) acc)
+     :range  (if (and (= :ref (:op (:left ast))) (= :ref (:op (:right ast))))
+               (if-let [r (pair->range wb (:left ast) (:right ast))]
+                 (conj! acc r) acc)
+               ;; a computed end (INDEX, OFFSET): what its expressions read
+               (->> (collect-reads wb env (:left ast) acc)
+                    (collect-reads wb env (:right ast))))
      :name   (if (contains? env (:value ast))
                acc
                (if-let [t (resolve-name wb (:value ast))]
@@ -538,10 +542,40 @@
           whole? (assoc :ref-r0 ref-r0 :ref-r1 ref-r1
                         :ref-c0 ref-c0 :ref-c1 ref-c1))))))
 
+(declare eval-ast)
+
+(defn- range-endpoint
+  "Where an end of a range operator is: `{:sheet :r0 :c0 :r1 :c1}`. A
+   reference is where it points; any other expression is evaluated, and a
+   result that is a reference (an area with a :sheet, or a value INDEX
+   tagged with :ref) is where it is; else nil."
+  [wb node]
+  (let [v (eval-ast wb node)
+        sheet-of #(when % (get (:sheet-names wb) %))]
+    (cond
+      (and (= :area (:t v)) (:sheet v))
+      (when-let [s (sheet-of (:sheet v))]
+        {:sheet s :r0 (long (:r0 v)) :c0 (long (:c0 v)) :r1 (long (:r1 v)) :c1 (long (:c1 v))})
+      (:ref v)
+      (when-let [s (sheet-of (get-in v [:ref :sheet]))]
+        (let [{:keys [row col]} (:ref v)] {:sheet s :r0 row :c0 col :r1 row :c1 col}))
+      :else nil)))
+
 (defn- eval-range [wb ast]
-  (if-let [rng (pair->range wb (:left ast) (:right ast))]
-    (range->area wb rng)
-    val/ERR-REF))
+  (let [{:keys [left right]} ast]
+    (if (and (= :ref (:op left)) (= :ref (:op right)))
+      (if-let [rng (pair->range wb left right)]
+        (range->area wb rng)
+        val/ERR-REF)
+      ;; A1:INDEX(…), INDEX(…):INDEX(…), OFFSET(…):B9 — the smallest
+      ;; rectangle holding both ends, as Excel's range operator
+      (let [a (if (= :ref (:op left)) (when-let [r (pair->range wb left left)] (select-keys r [:sheet :r0 :c0 :r1 :c1])) (range-endpoint wb left))
+            b (if (= :ref (:op right)) (when-let [r (pair->range wb right right)] (select-keys r [:sheet :r0 :c0 :r1 :c1])) (range-endpoint wb right))]
+        (if (and a b (= (:sheet a) (:sheet b)))
+          (range->area wb {:sheet (:sheet a)
+                           :r0 (min (:r0 a) (:r0 b)) :c0 (min (:c0 a) (:c0 b))
+                           :r1 (max (:r1 a) (:r1 b)) :c1 (max (:c1 a) (:c1 b))})
+          val/ERR-REF)))))
 
 (defn- eval-table-ref [wb ast]
   (if-let [rng (table-ref->range wb ast functions/*current-cell*)]
@@ -651,8 +685,11 @@
                      (cond
                        (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
                        val/ERR-REF
+                       ;; a single cell's value, tagged with where it is, so
+                       ;; OFFSET(INDIRECT("A1"),…) and range ends can use it
                        (and (= r0 r1) (= c0 c1))
-                       (cell-value wb (cell/pack s r0 c0))
+                       (assoc (cell-value wb (cell/pack s r0 c0))
+                              :ref {:sheet (sheet-name-of wb s) :row r0 :col c0})
                        :else
                        {:t :area :sheet (:sheet coords)
                         :r0 r0 :c0 c0 :r1 r1 :c1 c1
@@ -1313,6 +1350,13 @@
             pending
             (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))] [r c]))))
 
+(defn- blank-as-zero [v]
+  (cond
+    (:ref v) (blank-as-zero (dissoc v :ref))
+    (val/blank? v) (val/number 0.0)
+    (= :area (:t v)) (update v :values (fn [rows] (mapv (fn [row] (mapv #(if (val/blank? %) (val/number 0.0) %) row)) rows)))
+    :else v))
+
 (declare recalc-impl)
 
 (defn recalc
@@ -1366,7 +1410,11 @@
                                      (= (long (:r0 v)) (long (:r1 v)))
                                      (= (long (:c0 v)) (long (:c1 v))))
                               (get-in (:values v) [0 0] val/BLANK)
-                              v)]
+                              v)
+                          ;; a formula shows an empty cell it refers to as 0
+                          ;; (=A1, INDEX/VLOOKUP landing on one, a spilled
+                          ;; element), as Excel does; "" stays text
+                          v (blank-as-zero v)]
                       (cond
                         (contains? (:array-ranges wb) id)
                         [(fill-array-range wb pending id v) wb]

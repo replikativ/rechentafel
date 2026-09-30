@@ -16,7 +16,8 @@
             [rechentafel.fn.datetime :as datetime]
             [rechentafel.platform :as p]
             [rechentafel.value :as val]
-            [rechentafel.functions :as f]))
+            [rechentafel.functions :as f]
+            [rechentafel.fn.numfmt :as numfmt]))
 
 (defn- letter? [c]
   #?(:clj  (Character/isLetter ^char c)
@@ -322,7 +323,9 @@
   ;; TEXTJOIN(delimiter, ignore_empty, text1, ...)
              (fn [args]
                (let [delim (f/str! (nth args 0))
-                     ignore-empty? (f/bool! (nth args 1))
+                     ;; left empty (TEXTJOIN(",",,…)) Excel ignores empty
+                     ;; values, as its saved results show
+                     ignore-empty? (if (val/blank? (nth args 1)) true (f/bool! (nth args 1)))
                      rest-args (subvec (vec args) 2)
                      parts (volatile! (transient []))]
                  (f/each-scalar
@@ -641,28 +644,25 @@
              ^{:scalar? true}
              (fn [args]
                (let [v   (nth args 0)
-                     fmt (f/str! (nth args 1))]
-                 (if (= fmt "@")
-                   (val/to-str v)
-                   (let [x (val/to-num v)]
-                     (cond
-                       (val/err? x) (f/domain-error! (:v x))
-                       (not (val/num? x)) (f/domain-error! :value)
-                       :else
-                       (if-let [toks (and (not (re-find #"(?i)^general$" fmt)) (date-tokens fmt))]
-                         (if (neg? (double (:v x)))
-                           (f/domain-error! :value)
-                           (val/string (format-date (double (:v x)) toks)))
-                         (let [n (double (:v x))
-                               pct? (str/includes? fmt "%")
-                               scaled (if pct? (* n 100.0) n)
-                               decimals (let [parts (str/split fmt #"\." 2)]
-                                          (if (= 2 (count parts))
-                                            (count (re-seq #"[0#]" (second parts)))
-                                            0))
-                               grouped? (boolean (re-find #"[0#],[0#]" fmt))
-                               body (format-fixed scaled decimals grouped?)]
-                           (val/string (if pct? (str body "%") body)))))))))
+                     fmt (f/str! (nth args 1))
+                     x   (val/to-num v)]
+                 (cond
+                   (val/err? v) (f/domain-error! (:v v))
+                   ;; text that is not a number goes through the text section
+                   (not (val/num? x))
+                   (val/string (numfmt/format-value fmt {:text (:v (val/to-str v))}
+                                                    {:date-tokens date-tokens :date-format (fn [_ _] "")}))
+                   :else
+                   (let [n (double (:v x))
+                         out (numfmt/format-value
+                              fmt {:number n}
+                              {:date-tokens (fn [section] (and (not (re-find #"(?i)^general$" section)) (date-tokens section)))
+                               :date-format (fn [serial section]
+                                              (if (neg? (double serial))
+                                                (f/domain-error! :value)
+                                                (format-date (double serial) (date-tokens section))))})]
+                     ;; General: the number as a cell shows it
+                     (val/string (or out (:v (val/to-str x)) ""))))))
              :arity [2 2])
 
 ;; ---------------------------------------------------------------------------
@@ -756,19 +756,35 @@
 (f/register! "TEXTAFTER"  (text-before-after :after)  :arity [2 6])
 
 (f/register! "TEXTSPLIT"
-  ;; TEXTSPLIT(text, col-delim, [row-delim], [ignore-empty], [match-mode], [pad])
-  ;; Without array semantics we collapse to a single string: join fragments
-  ;; back with a bar separator so at least the parse is observable. This
-  ;; matches what a scalar spreadsheet sees in its first spill cell.
-             ^{:scalar? true}
+  ;; TEXTSPLIT(text, col_delimiter, [row_delimiter], [ignore_empty],
+  ;;           [match_mode], [pad_with]) — an array: rows split by
+  ;; row_delimiter, each row by col_delimiter; a delimiter may be an array
+  ;; of strings (any of them splits); match_mode 1 ignores case; ragged rows
+  ;; are padded with pad_with (#N/A by default).
              (fn [args]
-               (let [s      (f/str! (nth args 0))
-                     d      (f/str! (nth args 1))
-                     ignore (and (> (count args) 3)
-                                 (not (zero? (long (f/num! (nth args 3))))))
-                     parts  (if (zero? (count d))
-                              [s]
-                              (str/split s (re-pattern (p/regex-quote d))))
-                     parts  (if ignore (remove empty? parts) parts)]
-                 (val/string (first parts))))
+               (let [arg (fn [i] (when (> (count args) i) (nth args i)))
+                     given? (fn [i] (and (arg i) (not (val/blank? (arg i)))))
+                     delims (fn [v] (when v
+                                      (vec (remove empty? (map #(:v (val/to-str %))
+                                                               (if (f/area? v) (apply concat (:values v)) [v]))))))
+                     s (f/str! (nth args 0))
+                     cols-d (delims (arg 1))
+                     rows-d (when (given? 2) (delims (arg 2)))
+                     ignore? (and (given? 3) (val/truthy? (arg 3)))
+                     ci? (and (given? 4) (= 1 (long (f/num! (arg 4)))))
+                     pad (if (given? 5) (arg 5) val/ERR-NA)
+                     splitter (fn [ds]
+                                (if (seq ds)
+                                  (re-pattern (str (when ci? "(?i)") (str/join "|" (map p/regex-quote ds))))
+                                  nil))
+                     split (fn [text re] (if re (str/split text re -1) [text]))
+                     rows (split s (splitter rows-d))
+                     rows (if ignore? (remove empty? rows) rows)
+                     cells (mapv (fn [r] (let [cs (split r (splitter cols-d))]
+                                           (vec (if ignore? (remove empty? cs) cs))))
+                                 rows)
+                     cells (if (seq cells) cells [[""]])
+                     width (apply max 1 (map count cells))]
+                 {:t :area :r0 0 :c0 0 :r1 (dec (count cells)) :c1 (dec width)
+                  :values (mapv (fn [row] (vec (concat (map val/string row) (repeat (- width (count row)) pad)))) cells)}))
              :arity [2 6])

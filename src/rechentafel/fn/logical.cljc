@@ -118,13 +118,30 @@
                    :else (else-v))))
              :arity [2 3] :lazy? true)
 
+(defn- replace-errors
+  "Array `v` with each element `hit?` replaced by the alternative at its
+   position (`alt` an array: by position, a single row or column repeated;
+   else the value itself). Not `lift-call`, which propagates an element's
+   error before the replacement can see it."
+  [v alt hit?]
+  (let [avs (when (f/area? alt) (:values alt))
+        at (fn [i j]
+             (if avs
+               (let [i' (if (= 1 (count avs)) 0 i) j' (if (= 1 (count (first avs))) 0 j)]
+                 (get-in avs [i' j'] val/ERR-NA))
+               alt))]
+    (-> (dissoc v :sheet :ref-r0 :ref-r1 :ref-c0 :ref-c1)
+        (update :values (fn [rows]
+                          (vec (map-indexed (fn [i row]
+                                              (vec (map-indexed (fn [j x] (if (hit? x) (at i j) x)) row)))
+                                            rows)))))))
+
 (f/register! "IFERROR"
              ;; element-wise over an array value, as IF
              (fn [ctx ast-args]
                (let [v (eval1 ctx (nth ast-args 0))]
                  (cond
-                   (f/area? v) (f/lift-call (fn [[x alt]] (if (val/err? x) alt x))
-                                            [v (eval1 ctx (nth ast-args 1))])
+                   (f/area? v) (replace-errors v (eval1 ctx (nth ast-args 1)) val/err?)
                    (val/err? v) (eval1 ctx (nth ast-args 1))
                    :else v)))
              :arity [2 2] :lazy? true)
@@ -134,8 +151,7 @@
                (let [v (eval1 ctx (nth ast-args 0))
                      na? #(and (val/err? %) (= :na (:v %)))]
                  (cond
-                   (f/area? v) (f/lift-call (fn [[x alt]] (if (na? x) alt x))
-                                            [v (eval1 ctx (nth ast-args 1))])
+                   (f/area? v) (replace-errors v (eval1 ctx (nth ast-args 1)) na?)
                    (na? v) (eval1 ctx (nth ast-args 1))
                    :else v)))
              :arity [2 2] :lazy? true)

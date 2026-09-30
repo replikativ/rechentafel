@@ -33,7 +33,12 @@
     CellType/STRING  {:t :str :v (.getStringCellValue c)}
     CellType/BOOLEAN (.getBooleanCellValue c)
     CellType/BLANK   nil
-    CellType/ERROR   nil
+    ;; a literal error value (#N/A typed in, or pasted as a value) is that
+    ;; error, not a blank: ISERROR/IFNA and lookups see it
+    CellType/ERROR   (get {0x00 {:t :err :v :null} 0x07 {:t :err :v :div0} 0x0F {:t :err :v :value}
+                           0x17 {:t :err :v :ref} 0x1D {:t :err :v :name} 0x24 {:t :err :v :num}
+                           0x2A {:t :err :v :na}}
+                          (int (.getErrorCellValue c)))
     CellType/_NONE   nil))
 
 (defn- dynamic-array?

@@ -12,7 +12,8 @@
     {:t :area  :sheet \"S\" :r0 0 :c0 0 :r1 4 :c1 2 :values [[...] [...]]}
 
   Values are Datahike-safe by construction — all plain data."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [rechentafel.datetext :as datetext]))
 
 (def error-codes
   "Numeric codes POI uses; kept for round-trip with the legacy engine."
@@ -93,7 +94,9 @@
     :num   v
     :bool  (number (if (:v v) 1.0 0.0))
     :blank (number 0.0)
-    :str   (if-let [n (parse-number (:v v))] (number n) ERR-VALUE)
+    ;; numeric text, or text Excel reads as a date/time ("22:30",
+    ;; "1 Oct 2021"), as Excel coerces it
+    :str   (if-let [n (or (parse-number (:v v)) (datetext/parse (:v v)))] (number n) ERR-VALUE)
     :err   v
     :area  (to-num (first-cell-of v))
     :ref   (to-num (:resolved v ERR-VALUE))

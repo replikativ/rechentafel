@@ -103,14 +103,15 @@
   (is (= (s "H")   (f/call "TEXTBEFORE" [(s "HELLO") (s "e") (n 1) (n 1)])))
   (is (= (s "LLO") (f/call "TEXTAFTER"  [(s "HELLO") (s "e") (n 1) (n 1)]))))
 
-(deftest text-split-scalar
-  ;; Our engine lacks spill ranges, so TEXTSPLIT collapses to the first
-  ;; fragment. Enough to prove the parse runs; full array semantics are a
-  ;; separate feature.
-  (is (= (s "a") (f/call "TEXTSPLIT" [(s "a,b,c") (s ",")])))
-  (is (= (s "")  (f/call "TEXTSPLIT" [(s ",a,b") (s ",")])))
-  (is (= (s "a") (f/call "TEXTSPLIT"
-                         [(s ",a,b") (s ",") v/BLANK (n 1)]))))  ;; ignore-empty
+(deftest text-split-is-an-array
+  ;; TEXTSPLIT returns the fragments as an array (rows by row_delimiter)
+  (let [vals #(mapv (fn [row] (mapv :v row)) (:values %))]
+    (is (= [["a" "b" "c"]] (vals (f/call "TEXTSPLIT" [(s "a,b,c") (s ",")]))))
+    (is (= [["" "a" "b"]] (vals (f/call "TEXTSPLIT" [(s ",a,b") (s ",")]))))
+    (is (= [["a" "b"]] (vals (f/call "TEXTSPLIT" [(s ",a,b") (s ",") v/BLANK (n 1)]))) "ignore_empty")
+    (is (= [["a" "b"] ["c" :na]] (mapv (fn [row] (mapv #(if (= :err (:t %)) (:v %) (:v %)) row))
+                                       (:values (f/call "TEXTSPLIT" [(s "a,b;c") (s ",") (s ";")]))))
+        "rows, padded with #N/A")))
 
 (deftest number-formatting
   (is (= (n 3.14) (f/call "NUMBERVALUE" [(s "3,14") (s ",")])))

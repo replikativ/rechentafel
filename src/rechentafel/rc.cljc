@@ -46,9 +46,9 @@
   [ast origin-row origin-col]
   (case (:op ast)
     :ref   (normalize-ref ast origin-row origin-col)
-    :range (-> ast
-               (assoc :left  (normalize-ref (:left ast) origin-row origin-col))
-               (assoc :right (normalize-ref (:right ast) origin-row origin-col)))
+    ;; an end of a range may be an expression (A1:INDEX(…)), not a ref
+    :range (let [end #(if (= :ref (:op %)) (normalize-ref % origin-row origin-col) (normalize % origin-row origin-col))]
+             (-> ast (update :left end) (update :right end)))
     :call  (update ast :args (fn [args]
                                (mapv #(normalize % origin-row origin-col) args)))
     :binop (-> ast
@@ -100,9 +100,8 @@
   [ast origin-row origin-col]
   (case (:op ast)
     :ref   (resolve-ref ast origin-row origin-col)
-    :range (-> ast
-               (assoc :left  (resolve-ref (:left ast) origin-row origin-col))
-               (assoc :right (resolve-ref (:right ast) origin-row origin-col)))
+    :range (let [end #(if (= :ref (:op %)) (resolve-ref % origin-row origin-col) (resolve-at % origin-row origin-col))]
+             (-> ast (update :left end) (update :right end)))
     :call  (update ast :args (fn [args]
                                (mapv #(resolve-at % origin-row origin-col) args)))
     :binop (-> ast

@@ -980,15 +980,36 @@
    14 "LARGE", 15 "SMALL", 16 "PERCENTILE.INC", 17 "QUARTILE.INC",
    18 "PERCENTILE.EXC", 19 "QUARTILE.EXC"})
 
+(defn- without-errors
+  "`v` with its error values left out: an area becomes a one-row area of
+   its other values (a blank when none are left), an error scalar nil."
+  [v]
+  (cond
+    (f/area? v) (let [kept (vec (remove val/err? (apply concat (:values v))))]
+                  {:t :area :r0 0 :c0 0 :r1 0 :c1 (max 0 (dec (count kept)))
+                   :values [(if (seq kept) kept [val/BLANK])]})
+    (val/err? v) nil
+    :else v))
+
 (f/register! "AGGREGATE"
-  ;; Full AGGREGATE has two options controls; we ignore `options` for now
-  ;; (which means ignore-error / ignore-hidden). POI does the same for
-  ;; most cases.
+  ;; AGGREGATE(function, options, ref1, …) or (function, options, array, k).
+  ;; options (as Excel and LibreOffice's ScAggregate): 2, 3, 6, 7 ignore
+  ;; error values in the data; 1, 3, 5, 7 also ignore hidden rows, which a
+  ;; workbook here does not record; nested SUBTOTAL/AGGREGATE are not
+  ;; excluded.
              (fn [args]
                (let [code (long (f/num! (nth args 0)))
+                     option (if (val/blank? (nth args 1)) 0 (long (f/num! (nth args 1))))
                      fname (or (aggregate-dispatch code) (f/domain-error! :value))
-          ;; arg 1 is options; the remaining are the data (plus optional k for
-          ;; LARGE/SMALL/PERCENTILE/QUARTILE which expect k as the last arg).
-                     data (subvec (vec args) 2)]
+                     _ (when-not (<= 0 option 7) (f/domain-error! :value))
+                     ignore-errors? (contains? #{2 3 6 7} option)
+                     data (subvec (vec args) 2)
+                     ;; the array forms (14-19) take k last: it is not data
+                     array-form? (>= code 14)
+                     data (if ignore-errors?
+                            (if array-form?
+                              (into [(without-errors (first data))] (rest data))
+                              (vec (keep without-errors data)))
+                            data)]
                  (f/call fname data)))
              :arity [3 nil])
