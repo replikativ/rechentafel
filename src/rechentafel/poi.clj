@@ -36,11 +36,19 @@
     CellType/ERROR   nil
     CellType/_NONE   nil))
 
+(defn- dynamic-array?
+  "A dynamic-array (spilling) formula: stored like a legacy array formula
+   (`t=\"array\"`), but with cell metadata (`cm`) naming its dynamic-array
+   properties. A legacy Ctrl+Shift+Enter formula has none."
+  [^Cell c]
+  (and (instance? org.apache.poi.xssf.usermodel.XSSFCell c)
+       (.isSetCm (.getCTCell ^org.apache.poi.xssf.usermodel.XSSFCell c))))
+
 (defn- array-formula-sibling?
   "Cells in an array-formula range that are NOT the top-left anchor.
   POI replicates the formula across all cells of the range, but only
-  the anchor should drive evaluation in our engine — the rest get
-  filled in when the spill materialises. Detect the anchor by
+  the anchor drives evaluation — it fills the rest of the range
+  (`eval/set-array-formula`). Detect the anchor by
   comparing the cell's coords to the range's first row/col."
   [^Cell c]
   (when (.isPartOfArrayFormulaGroup c)
@@ -63,9 +71,15 @@
                             (array-formula-sibling? c) wb
                             :else
                             (let [input (cell-input c)
-                                  id (cell/pack si (int (.getRowIndex c)) (int (.getColumnIndex c)))]
+                                  id (cell/pack si (int (.getRowIndex c)) (int (.getColumnIndex c)))
+                                  ;; a legacy array formula's anchor: fills its range
+                                  arr (when (and (string? input) (.isPartOfArrayFormulaGroup c)
+                                                 (not (dynamic-array? c)))
+                                        (.getArrayFormulaRange c))]
                               (if (nil? input) wb
-                                  (try (e/set-cell wb id input)
+                                  (try (if arr
+                                         (e/set-array-formula wb id input (.getLastRow arr) (.getLastColumn arr))
+                                         (e/set-cell wb id input))
                                        ;; one formula we cannot parse is that
                                        ;; cell's #NAME? (as Excel shows a formula
                                        ;; it cannot read), not a failed workbook;

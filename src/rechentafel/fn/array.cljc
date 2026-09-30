@@ -62,8 +62,10 @@
   ;; SEQUENCE(rows, [cols], [start], [step]) — produces a rows×cols
   ;; numeric area starting at `start` and stepping by `step` row-major.
              (fn [args]
-               (let [rows  (int-arg args 0)
-                     cols  (int-arg args 1 1)
+               (let [;; an omitted argument, SEQUENCE(,3), is its default
+                     omitted? #(or (<= (count args) %) (val/blank? (nth args %)))
+                     rows  (if (omitted? 0) 1 (int-arg args 0))
+                     cols  (if (omitted? 1) 1 (int-arg args 1 1))
                      start (if (>= (count args) 3) (num-arg args 2) 1.0)
                      step  (if (>= (count args) 4) (num-arg args 3) 1.0)]
                  (when (or (<= rows 0) (<= cols 0)) (f/domain-error! :value))

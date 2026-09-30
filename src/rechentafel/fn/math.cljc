@@ -942,12 +942,13 @@
                      bins (f/collect-finite-numerics [(nth args 1)])
                      n    (count bins)
                      counts (long-array (inc n))]
+                 ;; a value counts in the smallest bin at or above it; the
+                 ;; counts stay in the bins' given order (unsorted bins, as
+                 ;; in LOOKUP(1,1/FREQUENCY(0,ABS(r-x)),r), keep their places)
                  (doseq [^double d data]
-                   (let [idx (loop [i 0]
-                               (cond
-                                 (= i n) n
-                                 (<= d (double (nth bins i))) i
-                                 :else (recur (inc i))))]
+                   (let [idx (or (some->> (keep-indexed (fn [i b] (when (<= d (double b)) [(double b) i])) bins)
+                                          seq sort first second)
+                                 n)]
                      (aset counts idx (inc (aget counts idx)))))
                  (area-from-matrix (mapv vector (map double (seq counts))))))
              :arity [2 2] :array? true)
