@@ -56,10 +56,11 @@
   (let [wb (mk [0 0 "=SUM({1;2}+{10,20})"])]
     (is (= 66.0 (:v (at wb 0 0))))))
 
-(deftest shape-mismatch-yields-value-error
-  (let [wb (mk [0 0 "=SUM({1,2,3}+{10,20})"])]
-    ;; SUM of #VALUE! propagates the error
-    (is (= :value (:v (at wb 0 0))))))
+(deftest arrays-of-different-sizes-fill-with-na
+  ;; as Excel: {1,2,3}+{10,20} is {11,22,#N/A}
+  (let [wb (mk [0 0 "=SUM({1,2,3}+{10,20})"] [1 0 "=SUM(IFERROR({1,2,3}+{10,20},0))"])]
+    (is (= :na (:v (at wb 0 0))) "SUM sees the #N/A")
+    (is (= 33.0 (:v (at wb 1 0))) "the elements that exist")))
 
 ;; ---------------------------------------------------------------------------
 ;; Error propagation per cell

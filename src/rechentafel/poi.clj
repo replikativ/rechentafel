@@ -33,7 +33,12 @@
     CellType/STRING  {:t :str :v (.getStringCellValue c)}
     CellType/BOOLEAN (.getBooleanCellValue c)
     CellType/BLANK   nil
-    CellType/ERROR   nil
+    ;; a literal error value (#N/A typed in, or pasted as a value) is that
+    ;; error, not a blank: ISERROR/IFNA and lookups see it
+    CellType/ERROR   (get {0x00 {:t :err :v :null} 0x07 {:t :err :v :div0} 0x0F {:t :err :v :value}
+                           0x17 {:t :err :v :ref} 0x1D {:t :err :v :name} 0x24 {:t :err :v :num}
+                           0x2A {:t :err :v :na}}
+                          (int (.getErrorCellValue c)))
     CellType/_NONE   nil))
 
 (defn- dynamic-array?
@@ -166,6 +171,71 @@
                    (catch Throwable _ wb)))    ;; skip names we can't parse
             wb chosen)))
 
+;; ---------------------------------------------------------------------------
+;; External books
+
+(defn- xml-doc
+  "A DOM of `in`, parsed with DTDs refused (no entity expansion)."
+  [^java.io.InputStream in]
+  (let [f (doto (javax.xml.parsers.DocumentBuilderFactory/newInstance)
+            (.setNamespaceAware true)
+            (.setFeature "http://apache.org/xml/features/disallow-doctype-decl" true)
+            (.setXIncludeAware false)
+            (.setExpandEntityReferences false))]
+    (.parse (.newDocumentBuilder f) in)))
+
+(defn- children [^org.w3c.dom.Node n local]
+  (let [ns (.getChildNodes n)]
+    (for [i (range (.getLength ns))
+          :let [c (.item ns (int i))]
+          :when (and (instance? org.w3c.dom.Element c) (= local (.getLocalName c)))]
+      c)))
+
+(def ^:private error-codes
+  {"#NULL!" :null "#DIV/0!" :div0 "#VALUE!" :value "#REF!" :ref "#NAME?" :name "#NUM!" :num "#N/A" :na})
+
+(defn- cached-value
+  "The tagged value of an externalLink `<cell>`: `t` is n (default), str,
+   s, b or e, the value in `<v>`."
+  [^org.w3c.dom.Element c]
+  (when-let [^org.w3c.dom.Element v (first (children c "v"))]
+    (let [text (.getTextContent v)]
+      (case (.getAttribute c "t")
+        ("str" "s" "inlineStr") {:t :str :v text}
+        "b" {:t :bool :v (= "1" text)}
+        "e" {:t :err :v (get error-codes text :na)}
+        {:t :num :v (Double/parseDouble text)}))))
+
+(defn- load-external-books
+  "The cached sheets of each linked book (xl/externalLinks/externalLinkN.xml),
+   as [n]Sheet references find them: n counts the workbook's external
+   references from 1. See `eval/define-external-sheet`."
+  [wb ^Workbook poi]
+  (if-not (instance? org.apache.poi.xssf.usermodel.XSSFWorkbook poi)
+    wb
+    (reduce
+     (fn [wb [i ^org.apache.poi.xssf.model.ExternalLinksTable link]]
+       (try
+         (with-open [in (.getInputStream (.getPackagePart link))]
+           (let [root (.getDocumentElement (xml-doc in))
+                 book (first (children root "externalBook"))
+                 names (vec (for [sn (mapcat #(children % "sheetName") (children book "sheetNames"))]
+                              (.getAttribute ^org.w3c.dom.Element sn "val")))]
+             (reduce (fn [wb ^org.w3c.dom.Element sd]
+                       (let [k (Long/parseLong (.getAttribute sd "sheetId"))
+                             cells (for [row (children sd "row") ^org.w3c.dom.Element c (children row "cell")
+                                         :let [v (cached-value c) ref (CellReference. (.getAttribute c "r"))]
+                                         :when v]
+                                     [(.getRow ref) (.getCol ref) v])]
+                         (if (< k (count names))
+                           (e/define-external-sheet wb (str (inc i)) (nth names k) cells)
+                           wb)))
+                     wb
+                     (mapcat #(children % "sheetData") (children book "sheetDataSet")))))
+         (catch Exception _ wb)))
+     wb
+     (map-indexed vector (.getExternalLinksTable ^org.apache.poi.xssf.usermodel.XSSFWorkbook poi)))))
+
 (defn load-workbook
   "Read `path` with Apache POI and return a recalculated spread workbook.
   Formulas are re-evaluated by our interpreter, not POI. Excel tables
@@ -179,5 +249,6 @@
     (-> (e/empty-workbook (sheet-names poi))
         (load-tables poi)
         (load-defined-names poi)
+        (load-external-books poi)
         (load-cells poi)
         (e/recalc))))

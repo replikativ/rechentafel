@@ -35,8 +35,9 @@
 ;; Equality + ordering used by VLOOKUP/HLOOKUP/MATCH
 
 (defn- values-equal?
-  "POI-compatible equality for lookup comparisons. Case-insensitive for
-  strings, numeric-equal for numbers, same-error for errors."
+  "Equality for lookup comparisons, as Excel's: case-insensitive for
+  strings, numeric-equal for numbers, same-error for errors, never across
+  types."
   [a b]
   (cond
     (and (val/err? a) (val/err? b)) (= (:v a) (:v b))
@@ -45,11 +46,8 @@
     (and (val/bool? a) (val/bool? b)) (= (:v a) (:v b))
     (and (val/str? a) (val/str? b))
     (= (str/lower-case (:v a)) (str/lower-case (:v b)))
-    ;; cross-type: coerce right toward left's type (POI's loose match)
-    (val/num? a) (let [n (val/to-num b)] (and (val/num? n) (== (:v a) (:v n))))
-    (val/str? a) (let [s (val/to-str b)] (and (val/str? s)
-                                              (= (str/lower-case (:v a))
-                                                 (str/lower-case (:v s)))))
+    ;; as Excel's lookups: text never equals a number ("1" is not 1), and
+    ;; "" is not an empty cell (MATCH("",A:A,0) finds none)
     :else false))
 
 (defn- compare-values
@@ -81,6 +79,28 @@
         re  (re-pattern (str "^" pat "$"))]
     (boolean (re-matches re tgt))))
 
+;; Excel's approximate search looks only at values of the target's type:
+;; errors, blanks and other types are skipped, so MATCH(2,1/(cond)) finds
+;; the last match
+(defn- same-kind? [target v]
+  (cond (val/num? target) (val/num? v)
+        (val/str? target) (val/str? v)
+        (val/bool? target) (val/bool? v)
+        :else false))
+
+(defn- approx-position
+  "The 1-based position a binary search over `flat` ([idx cell] pairs)
+   lands on for `target`, stepping right while `(ok? (compare v target) 0)`;
+   #N/A when there is none."
+  [flat target ok?]
+  (let [vs (filterv #(same-kind? target (second %)) flat)
+        l (loop [l 0 r (count vs)]
+            (if (< l r)
+              (let [m (quot (+ l r) 2)]
+                (if (ok? (compare-values (second (nth vs m)) target) 0) (recur (inc m) r) (recur l m)))
+              l))]
+    (if (zero? l) val/ERR-NA (val/number (double (inc (first (nth vs (dec l)))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; MATCH
 
@@ -89,37 +109,39 @@
   ;;   1 (default): largest value <= lookup — lookup_array must be ascending
   ;;   0: exact match, allows wildcards when lookup_value is text
   ;;   -1: smallest value >= lookup — lookup_array must be descending
-             (fn [args]
-               (let [target (nth args 0)
-                     area   (nth args 1)
-                     mtype  (if (> (count args) 2) (long (f/num! (nth args 2))) 1)
-                     rows   (area-rows area)
+             (fn match-fn [args]
+               (if (and (f/area? (nth args 0))
+                        (> (count (apply concat (:values (nth args 0)))) 1))
+                 ;; an array of lookup values: one MATCH each, as Excel lifts it
+                 (let [a (nth args 0)]
+                   (-> (dissoc a :sheet :ref-r0 :ref-r1 :ref-c0 :ref-c1)
+                       (update :values (fn [rows] (mapv (fn [row] (mapv #(match-fn (assoc (vec args) 0 %)) row)) rows)))))
+                 (let [target (let [t (nth args 0)] (if (f/area? t) (get-in (:values t) [0 0] val/BLANK) t))
+                       area   (nth args 1)
+                       mtype  (if (> (count args) 2) (long (f/num! (nth args 2))) 1)
+                       rows   (area-rows area)
           ;; flatten into a 1-D sequence of [idx cell] pairs
-                     flat   (let [cols (count (first rows))]
-                              (if (> cols 1)
+                       flat   (let [cols (count (first rows))]
+                                (if (> cols 1)
                      ;; row vector
-                                (map-indexed vector (first rows))
-                                (map-indexed vector (map first rows))))]
-                 (case mtype
-                   0 (let [wild? (val/str? target)]
-                       (or (some (fn [[i v]]
-                                   (when (or (values-equal? target v)
-                                             (and wild? (val/str? v)
-                                                  (wildcard-match? (:v target) (:v v))))
-                                     (val/number (double (inc i)))))
-                                 flat)
-                           val/ERR-NA))
-                   1 (let [r (volatile! nil)]
-                       (doseq [[i v] flat]
-                         (when (<= (compare-values v target) 0)
-                           (vreset! r (inc i))))
-                       (if-let [idx @r] (val/number (double idx)) val/ERR-NA))
-                   -1 (let [r (volatile! nil)]
-                        (doseq [[i v] flat]
-                          (when (>= (compare-values v target) 0)
-                            (vreset! r (inc i))))
-                        (if-let [idx @r] (val/number (double idx)) val/ERR-NA))
-                   (f/domain-error! :value))))
+                                  (map-indexed vector (first rows))
+                                  (map-indexed vector (map first rows))))]
+                   (case mtype
+                     0 (let [wild? (val/str? target)]
+                         (or (some (fn [[i v]]
+                                     (when (or (values-equal? target v)
+                                               (and wild? (val/str? v)
+                                                    (wildcard-match? (:v target) (:v v))))
+                                       (val/number (double (inc i)))))
+                                   flat)
+                             val/ERR-NA))
+                   ;; approximate: a binary search, as Excel's (and IronCalc's
+                   ;; binary_search): on sorted data the position of the
+                   ;; largest value <= target; on unsorted data wherever the
+                   ;; search lands, not a linear scan's answer
+                     1 (approx-position flat target <=)
+                     -1 (approx-position flat target >=)
+                     (f/domain-error! :value)))))
              :arity [2 3])
 
 ;; ---------------------------------------------------------------------------
@@ -130,17 +152,17 @@
         cols (count (first rows))]
     (when (or (neg? col-idx) (>= col-idx cols)) (f/domain-error! :ref))
     (if exact?
-      (or (some (fn [row]
-                  (when (values-equal? target (first row))
-                    (nth row col-idx)))
-                rows)
-          val/ERR-NA)
-      ;; approximate match: largest first-column value <= target
-      (let [best (volatile! nil)]
-        (doseq [row rows]
-          (when (<= (compare-values (first row) target) 0)
-            (vreset! best row)))
-        (if-let [row @best] (nth row col-idx) val/ERR-NA)))))
+      ;; text may hold wildcards (* ? ~), as in MATCH type 0
+      (let [wild? (val/str? target)]
+        (or (some (fn [row]
+                    (when (or (values-equal? target (first row))
+                              (and wild? (val/str? (first row)) (wildcard-match? (:v target) (:v (first row)))))
+                      (nth row col-idx)))
+                  rows)
+            val/ERR-NA))
+      ;; approximate match: the binary search over the first column
+      (let [pos (approx-position (map-indexed (fn [i row] [i (first row)]) rows) target <=)]
+        (if (val/err? pos) pos (nth (nth rows (dec (long (:v pos)))) col-idx))))))
 
 (f/register! "VLOOKUP"
              (fn [args]
@@ -175,14 +197,9 @@
                  (if result
         ;; Vector form: search row-or-column of a, return matching pos in result.
                    (let [search (if (= 1 (count a)) (first a) (mapv first a))
-                         best (volatile! nil)
-                         result-vec (if (= 1 (count result)) (first result) (mapv first result))]
-                     (doseq [[i v] (map-indexed vector search)]
-                       (when (<= (compare-values v target) 0)
-                         (vreset! best i)))
-                     (if-let [i @best]
-                       (nth result-vec i val/ERR-NA)
-                       val/ERR-NA))
+                         result-vec (if (= 1 (count result)) (first result) (mapv first result))
+                         pos (approx-position (map-indexed vector search) target <=)]
+                     (if (val/err? pos) pos (nth result-vec (dec (long (:v pos))) val/ERR-NA)))
         ;; Array form: 2-D → pick last column/row as the result.
                    (let [rows (count a)
                          cols (count (first a))
@@ -194,13 +211,8 @@
                          last-series (if horizontal?
                                        (last a)
                                        (mapv last a))
-                         best (volatile! nil)]
-                     (doseq [[i v] (map-indexed vector search)]
-                       (when (<= (compare-values v target) 0)
-                         (vreset! best i)))
-                     (if-let [i @best]
-                       (nth last-series i val/ERR-NA)
-                       val/ERR-NA)))))
+                         pos (approx-position (map-indexed vector search) target <=)]
+                     (if (val/err? pos) pos (nth last-series (dec (long (:v pos))) val/ERR-NA))))))
              :arity [2 3])
 
 ;; ---------------------------------------------------------------------------
@@ -212,7 +224,13 @@
              (fn [args]
                (let [arr (nth args 0)
                      rows (area-rows arr)
-                     [nrows ncols] [(count rows) (count (first rows))]
+                     ;; a whole column/row (B:B) is clipped to the used cells;
+                     ;; INDEX counts over the reference, so a row past them
+                     ;; is an empty cell, not #REF!
+                     [nrows ncols] [(if (:ref-r1 arr) (inc (- (long (:ref-r1 arr)) (long (:ref-r0 arr)))) (count rows))
+                                    (if (:ref-c1 arr) (inc (- (long (:ref-c1 arr)) (long (:ref-c0 arr)))) (count (first rows)))]
+                     ;; a cell past the used ones is empty
+                     cell-at (fn [r c] (get-in rows [r c] val/BLANK))
                      ;; one index into a one-row array counts along the row
                      ;; (INDEX({"a","b","c"},2) is "b"), as in Excel
                      along-row? (and (= 2 (count args)) (= 1 nrows) (> ncols 1))
@@ -223,16 +241,25 @@
                               :else 1)]
                  (when (or (neg? rn) (> rn nrows)) (f/domain-error! :ref))
                  (when (or (neg? cn) (> cn ncols)) (f/domain-error! :ref))
-                 (cond
-                   (and (zero? rn) (zero? cn)) arr
-                   (zero? rn) ;; entire column cn
-                   {:t :area :r0 0 :c0 (dec cn) :r1 (dec nrows) :c1 (dec cn)
-                    :values (mapv (fn [row] [(nth row (dec cn))]) rows)}
-                   (zero? cn) ;; entire row rn
-                   {:t :area :r0 (dec rn) :c0 0 :r1 (dec rn) :c1 (dec ncols)
-                    :values [(nth rows (dec rn))]}
-                   :else
-                   (nth (nth rows (dec rn)) (dec cn)))))
+                 ;; over a reference (an area with a :sheet), the result is a
+                 ;; reference too: sub-areas keep their cells' coordinates, and
+                 ;; a single cell carries :ref, so A1:INDEX(A1:A9,3) is A1:A3
+                 (let [ref? (and (f/area? arr) (:sheet arr))
+                       br (if ref? (long (:r0 arr)) 0)
+                       bc (if ref? (long (:c0 arr)) 0)]
+                   (cond
+                     (and (zero? rn) (zero? cn)) arr
+                     (zero? rn) ;; entire column cn
+                     (cond-> {:t :area :r0 br :c0 (+ bc (dec cn)) :r1 (+ br (dec nrows)) :c1 (+ bc (dec cn))
+                              :values (mapv (fn [row] [(nth row (dec cn))]) rows)}
+                       ref? (assoc :sheet (:sheet arr)))
+                     (zero? cn) ;; entire row rn
+                     (cond-> {:t :area :r0 (+ br (dec rn)) :c0 bc :r1 (+ br (dec rn)) :c1 (+ bc (dec ncols))
+                              :values [(nth rows (dec rn))]}
+                       ref? (assoc :sheet (:sheet arr)))
+                     :else
+                     (cond-> (cell-at (dec rn) (dec cn))
+                       ref? (assoc :ref {:sheet (:sheet arr) :row (+ br (dec rn)) :col (+ bc (dec cn))}))))))
              :arity [2 4])
 
 ;; ---------------------------------------------------------------------------
@@ -341,36 +368,70 @@
               :c1 (max (:col l 0) (:col r 0))})
     nil))
 
+(defn- offset-area
+  "The area OFFSET gives for base `coords` and numbers `rows` `cols` `h` `w`
+   (`h`/`w` nil: the base's)."
+  [ctx coords rows cols h w]
+  (let [h  (or h (inc (- (long (:r1 coords)) (long (:r0 coords)))))
+        w  (or w (inc (- (long (:c1 coords)) (long (:c0 coords)))))
+        r0 (+ (long (:r0 coords)) (long rows))
+        c0 (+ (long (:c0 coords)) (long cols))
+        r1 (+ r0 (dec (long h)))
+        c1 (+ c0 (dec (long w)))]
+    (if (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
+      val/ERR-REF
+      (if-let [resolve-area (:resolve-area ctx)]
+        (resolve-area ctx {:sheet (:sheet coords) :r0 r0 :c0 c0 :r1 r1 :c1 c1})
+        val/ERR-REF))))
+
 (f/register! "OFFSET"
   ;; OFFSET(ref, rows, cols, [height], [width]) — shift the reference
   ;; by (rows, cols); optionally resize to (height, width). Height/width
   ;; default to the reference's own dimensions. Returns an area that
-  ;; the evaluator then resolves into values.
+  ;; the evaluator then resolves into values. With an array of rows, cols,
+  ;; heights or widths, an array of references (`f/refs?`), one per
+  ;; element, broadcast as arrays are.
              (fn [ctx ast-args]
                (let [ref-ast (first ast-args)
-                     rows    (long (f/num! (eval1 ctx (nth ast-args 1))))
-                     cols    (long (f/num! (eval1 ctx (nth ast-args 2))))
-                     coords  (ast->ref-coords ref-ast)]
-                 (if-not coords
-                   val/ERR-VALUE
-                   (let [h-def (inc (- (long (:r1 coords)) (long (:r0 coords))))
-                         w-def (inc (- (long (:c1 coords)) (long (:c0 coords))))
-                         h     (if (>= (count ast-args) 4)
-                                 (long (f/num! (eval1 ctx (nth ast-args 3))))
-                                 h-def)
-                         w     (if (>= (count ast-args) 5)
-                                 (long (f/num! (eval1 ctx (nth ast-args 4))))
-                                 w-def)
-                         r0    (+ (long (:r0 coords)) rows)
-                         c0    (+ (long (:c0 coords)) cols)
-                         r1    (+ r0 (dec h))
-                         c1    (+ c0 (dec w))]
-                     (if (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
-                       val/ERR-REF
-                       (if-let [resolve-area (:resolve-area ctx)]
-                         (resolve-area ctx {:sheet (:sheet coords)
-                                            :r0 r0 :c0 c0 :r1 r1 :c1 c1})
-                         val/ERR-REF))))))
+                     ;; an omitted argument (OFFSET(A1,0,0,,3)) is its default
+                     given?  #(and (> (count ast-args) %) (not= :missing (:op (nth ast-args %))))
+                     arg-at  #(when (given? %) (eval1 ctx (nth ast-args %)))
+                     ;; the base may be computed (OFFSET(INDIRECT(…),…),
+                     ;; OFFSET(INDEX(…),…)): a result that is a reference
+                     coords  (or (ast->ref-coords ref-ast)
+                                 (let [v (eval1 ctx ref-ast)]
+                                   (cond
+                                     (and (f/area? v) (:sheet v))
+                                     {:sheet (:sheet v) :r0 (:r0 v) :c0 (:c0 v) :r1 (:r1 v) :c1 (:c1 v)}
+                                     (:ref v)
+                                     (let [{:keys [sheet row col]} (:ref v)]
+                                       {:sheet sheet :r0 row :c0 col :r1 row :c1 col}))))
+                     ;; rows cols height width: numbers, nil when omitted, or arrays
+                     [rows cols h w :as ns] [(or (arg-at 1) (val/number 0)) (or (arg-at 2) (val/number 0)) (arg-at 3) (arg-at 4)]
+                     num (fn [v] (when (some? v) (long (f/num! v))))]
+                 (cond
+                   (not coords) val/ERR-VALUE
+                   (some f/area? ns)
+                   (let [arrays (filter f/area? ns)
+                         nr (reduce max (map #(count (:values %)) arrays))
+                         nc (reduce max (map #(count (first (:values %))) arrays))
+                         at (fn [v r c]
+                              (if (f/area? v)
+                                (let [g (:values v) row (nth g (if (= 1 (count g)) 0 r) nil)]
+                                  (nth row (if (= 1 (count row)) 0 c) nil))
+                                v))]
+                     {:t :refs
+                      :values (mapv (fn [r]
+                                      (mapv (fn [c]
+                                              (let [[a b hh ww] (map #(at % r c) ns)]
+                                                (if (and (some? a) (some? b) (or (nil? (nth ns 2)) (some? hh)) (or (nil? (nth ns 3)) (some? ww)))
+                                                  (try (offset-area ctx coords (num a) (num b) (num hh) (num ww))
+                                                       (catch #?(:clj Throwable :cljs :default) e
+                                                         (or (some-> (ex-data e) :excel-error val/error) val/ERR-VALUE)))
+                                                  val/ERR-NA)))
+                                            (range nc)))
+                                    (range nr))})
+                   :else (offset-area ctx coords (num rows) (num cols) (num h) (num w)))))
              :arity [3 5] :lazy? true :volatile? true)
 
 (f/register! "INDIRECT"

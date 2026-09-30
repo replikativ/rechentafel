@@ -45,7 +45,9 @@
                              :cljs (let [code (.charCodeAt c 0)]
                                      (or (and (>= code 65) (<= code 90))
                                          (and (>= code 97) (<= code 122)))))))
-(defn- alpha? [c] (or (letter? c) (= c \_)))
+;; typographic quotes are name characters, as in Excel: =IFERROR(x,“”)
+;; pasted from a document names “”, which is #NAME? when it is used
+(defn- alpha? [c] (or (letter? c) (= c \_) (= c \u201C) (= c \u201D) (= c \u2018) (= c \u2019)))
 ;; `$` is part of an identifier so `$A`, `$1`, `$A$1` scan as one token.
 ;; Plain `$`-cell-refs like `$A$1` succeed earlier via try-read-ref; the
 ;; ident path catches `$A`/`$1` (whole-col/row halves), dollar-prefixed
@@ -280,7 +282,12 @@
   these shapes. Does *not* consume trailing whitespace."
   [s i0]
   (let [[book i1] (or (try-read-workbook-bracket s i0) [nil i0])
-        [sheet1 j] (or (read-sheet-identifier s i1) [nil i1])]
+        [sheet1 j] (or (read-sheet-identifier s i1) [nil i1])
+        ;; quoted, the book is inside the quotes: '[1]May 2021'!A1,
+        ;; 'C:\dir\[Book.xlsx]Sheet 1'!A1
+        [book sheet1] (if-let [[_ b sh] (and (nil? book) sheet1 (re-matches #"(?s)(?:.*[\\/])?\[([^\]]+)\](.+)" sheet1))]
+                        [b sh]
+                        [book sheet1])]
     (cond
       (and book (nil? sheet1) (= \! (get s i1 nil)))
       (when-let [[ref k] (read-sheet-qualified s (inc i1) nil)]

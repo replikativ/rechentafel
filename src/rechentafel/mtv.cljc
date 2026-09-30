@@ -24,16 +24,19 @@
 ;; ---------------------------------------------------------------------------
 ;; Block record
 
-(defrecord Block [^long start ^long len type data])
+;; `data` is never written once a block holds it (every write builds new
+;; arrays), so blocks share it: a block is the `len` elements from `off`,
+;; and clipping one is a view, not a copy
+(defrecord Block [^long start ^long len type data ^long off])
 
 (defn empty-block [^long start ^long len]
-  (->Block start len :empty nil))
+  (->Block start len :empty nil 0))
 
 (defn num-block ^Block [^long start data]
-  (->Block start (p/arr-len data) :num data))
+  (->Block start (p/arr-len data) :num data 0))
 
 (defn gen-block ^Block [^long start data]
-  (->Block start (count data) :gen (p/objects-from data)))
+  (->Block start (count data) :gen (p/objects-from data) 0))
 
 ;; ---------------------------------------------------------------------------
 ;; Binary search: find block index covering row, or -1 if past end.
@@ -58,9 +61,9 @@
   (case (.-type b)
     :empty BLANK
     :num   (let [a (.-data b)]
-             {:t :num :v (aget a (- row (.-start b)))})
+             {:t :num :v (aget a (+ (.-off b) (- row (.-start b))))})
     :gen   (let [a (.-data b)
-                 v (aget a (- row (.-start b)))]
+                 v (aget a (+ (.-off b) (- row (.-start b))))]
              (if (nil? v) BLANK v))))
 
 (defn col-get [col ^long row]
@@ -90,16 +93,7 @@
       (< e cut-row) b
       :else
       (let [new-len (- cut-row (.-start b))]
-        (case (.-type b)
-          :empty (->Block (.-start b) new-len :empty nil)
-          :num   (let [src (.-data b)
-                       dst (p/make-num-array new-len)]
-                   (p/arr-copy! src 0 dst 0 new-len)
-                   (->Block (.-start b) new-len :num dst))
-          :gen   (let [src (.-data b)
-                       dst (p/make-gen-array new-len)]
-                   (p/arr-copy! src 0 dst 0 new-len)
-                   (->Block (.-start b) new-len :gen dst)))))))
+        (->Block (.-start b) new-len (.-type b) (.-data b) (.-off b))))))
 
 (defn- clip-block-after ^Block [^Block b ^long cut-row]
   ;; Return the suffix of b that starts at cut-row, or nil.
@@ -110,16 +104,9 @@
       :else
       (let [offset  (- cut-row (.-start b))
             new-len (- (.-len b) offset)]
-        (case (.-type b)
-          :empty (->Block cut-row new-len :empty nil)
-          :num   (let [src (.-data b)
-                       dst (p/make-num-array new-len)]
-                   (p/arr-copy! src offset dst 0 new-len)
-                   (->Block cut-row new-len :num dst))
-          :gen   (let [src (.-data b)
-                       dst (p/make-gen-array new-len)]
-                   (p/arr-copy! src offset dst 0 new-len)
-                   (->Block cut-row new-len :gen dst)))))))
+        (->Block cut-row new-len (.-type b) (.-data b) (+ (.-off b) offset))))))
+
+(declare col-put-block*)
 
 (defn col-put-block
   "Replace the row range covered by `new-block` with it. Existing blocks
@@ -131,33 +118,82 @@
         max-row (long (:max-row col))
         ns      (.-start new-block)
         ne      (+ ns (.-len new-block))
-        n       (count blocks)]
-    (loop [i 0
-           out (transient [])
-           inserted? false]
-      (if (= i n)
-        (let [out (if inserted? out (conj! out new-block))
-              new-max (max max-row (dec ne))]
-          (assoc col :blocks (persistent! out) :max-row new-max))
-        (let [^Block b (nth blocks i)
-              bs (.-start b)
-              be (+ bs (.-len b))]
-          (cond
+        n       (count blocks)
+        ^Block last-b (when (pos? n) (nth blocks (dec n)))
+        last-e  (if last-b (+ (.-start last-b) (.-len last-b)) 0)]
+    (cond
+      ;; past every block (a column filled top to bottom, as a loader and
+      ;; a recalc's flush write it): adjacent and of the same type, the
+      ;; last block grows (one copy); else the block is appended — no scan
+      (and last-b (= ns last-e) (= :empty (.-type last-b) (.-type new-block)))
+      (assoc col :blocks (assoc blocks (dec n) (->Block (.-start last-b) (+ (.-len last-b) (.-len new-block)) :empty nil 0))
+             :max-row (max max-row (dec ne)))
+
+      (and last-b (= ns last-e) (= (.-type last-b) (.-type new-block)) (#{:num :gen} (.-type new-block)))
+      (let [la (.-len last-b) lb (.-len new-block)
+            dst (if (= :num (.-type new-block)) (p/make-num-array (+ la lb)) (p/make-gen-array (+ la lb)))]
+        (p/arr-copy! (.-data last-b) (.-off last-b) dst 0 la)
+        (p/arr-copy! (.-data new-block) (.-off new-block) dst la lb)
+        (assoc col :blocks (assoc blocks (dec n) (->Block (.-start last-b) (+ la lb) (.-type new-block) dst 0))
+               :max-row (max max-row (dec ne))))
+
+      (>= ns last-e)
+      (assoc col :blocks (conj blocks new-block) :max-row (max max-row (dec ne)))
+
+      ;; one cell inside a block of its type (overwriting a value): that
+      ;; block, copied with the one element replaced
+      (and (= 1 (.-len new-block)) (#{:num :gen} (.-type new-block))
+           (let [i (block-idx blocks ns)]
+             (and (not (neg? i)) (= (.-type ^Block (nth blocks i)) (.-type new-block)))))
+      (let [i (block-idx blocks ns)
+            ^Block b (nth blocks i)
+            len (.-len b)
+            dst (if (= :num (.-type b)) (p/make-num-array len) (p/make-gen-array len))]
+        (p/arr-copy! (.-data b) (.-off b) dst 0 len)
+        (aset dst (- ns (.-start b)) (aget (.-data new-block) (.-off new-block)))
+        (assoc col :blocks (assoc blocks i (->Block (.-start b) len (.-type b) dst 0))))
+
+      :else
+      (col-put-block* col new-block blocks max-row ns ne n))))
+
+(defn- emit!
+  "`out` (a transient vector of blocks) with `b` after them; an empty block
+   right after an empty one joins it, so blanking a run cell by cell leaves
+   one block."
+  [out ^Block b]
+  (let [c (count out)
+        ^Block l (when (pos? c) (nth out (dec c)))]
+    (if (and l (= :empty (.-type l) (.-type b)) (= (+ (.-start l) (.-len l)) (.-start b)))
+      (assoc! out (dec c) (->Block (.-start l) (+ (.-len l) (.-len b)) :empty nil 0))
+      (conj! out b))))
+
+(defn- col-put-block* [col new-block blocks max-row ns ne n]
+  (loop [i 0
+         out (transient [])
+         inserted? false]
+    (if (= i n)
+      (let [out (if inserted? out (emit! out new-block))
+            new-max (max max-row (dec ne))]
+        (assoc col :blocks (persistent! out) :max-row new-max))
+      (let [^Block b (nth blocks i)
+            bs (.-start b)
+            be (+ bs (.-len b))]
+        (cond
             ;; b strictly before new-block
-            (<= be ns)
-            (recur (inc i) (conj! out b) inserted?)
+          (<= be ns)
+          (recur (inc i) (emit! out b) inserted?)
 
             ;; b strictly after new-block → emit new-block first if not done
-            (>= bs ne)
-            (let [out (if inserted? out (conj! out new-block))]
-              (recur (inc i) (conj! out b) true))
+          (>= bs ne)
+          (let [out (if inserted? out (emit! out new-block))]
+            (recur (inc i) (emit! out b) true))
 
             ;; b overlaps new-block → keep only its non-overlapping edges
-            :else
-            (let [out (if-let [p (clip-block-before b ns)] (conj! out p) out)
-                  out (if inserted? out (conj! out new-block))
-                  out (if-let [s (clip-block-after b ne)]  (conj! out s) out)]
-              (recur (inc i) out true))))))))
+          :else
+          (let [out (if-let [p (clip-block-before b ns)] (emit! out p) out)
+                out (if inserted? out (emit! out new-block))
+                out (if-let [s (clip-block-after b ne)]  (emit! out s) out)]
+            (recur (inc i) out true)))))))
 
 (defn col-put-num-range
   "Write a num-array over [start-row, start-row + (arr-len data))."
@@ -199,8 +235,9 @@
   (reduce (fn [acc ^Block b]
             (if (= :num (.-type b))
               (let [a (.-data b)
-                    n (p/arr-len a)]
-                (loop [i 0 acc acc]
+                    o (.-off b)
+                    n (+ o (.-len b))]
+                (loop [i o acc acc]
                   (if (= i n) acc
                       (recur (inc i) (f acc (aget a i))))))
               acc))

@@ -36,6 +36,7 @@
   data (`:line :col :offset :source :expected :got`). Use `format-error`
   on the ex-data to render a three-line diagnostic with a caret."
   (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [rechentafel.address :as addr]
             [rechentafel.lexer :as lex]))
 
@@ -234,11 +235,20 @@
   #VALUE? on malformed input — matches Excel's permissive parse /
   strict eval split."
   [name args]
-  (let [up (.toUpperCase ^String name)]
+  (let [;; the name as stored in a file: _xlfn.LET, _xlfn.LAMBDA
+        up (str/replace (str/upper-case name) #"^(_XLFN\.)?(_XLWS\.)?" "")
+        ;; and their parameters: _xlpm.x is x
+        unprefix (fn [args]
+                   (walk/postwalk (fn [n]
+                                    (if (and (map? n) (= :name (:op n)) (string? (:value n))
+                                             (re-find #"(?i)^_xlpm\." (:value n)))
+                                      (update n :value #(subs % 6))
+                                      n))
+                                  args))]
     (case up
-      "LET"    (or (desugar-let args)
+      "LET"    (or (desugar-let (unprefix args))
                    {:op :call :name name :args args})
-      "LAMBDA" (or (desugar-lambda args)
+      "LAMBDA" (or (desugar-lambda (unprefix args))
                    {:op :call :name name :args args})
       {:op :call :name name :args args})))
 

@@ -121,7 +121,8 @@
                                                c (range c0 (inc c1))]
                                            [r c])))))
                            {} spills)]
-    (doseq [si (range (count sheets))]
+    ;; the workbook's own sheets, not external books' cached ones
+    (doseq [si (sort (vals (:sheet-names spread-wb)))]
       (let [^XSSFSheet xs (.getSheetAt wb-out si)
             mtv-sheet (get sheets si)]
         (doseq [[col-idx col] (map-indexed vector mtv-sheet)

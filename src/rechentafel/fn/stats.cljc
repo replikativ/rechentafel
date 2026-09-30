@@ -221,23 +221,31 @@
 ;; ---------------------------------------------------------------------------
 ;; LARGE / SMALL
 
+(defn- kth-of
+  "The k-th of sorted `xs`; an array of k gives an array of results (in
+   k's shape), as SMALL(r,{1;2;3}) in Excel."
+  [xs k]
+  (let [one (fn [kv] (let [k (long (f/num! kv))]
+                       (if (or (<= k 0) (> k (count xs))) val/ERR-NUM (val/number (nth xs (dec k))))))]
+    (if (and (f/area? k) (> (count (apply concat (:values k))) 1))
+      (-> (dissoc k :sheet :ref-r0 :ref-r1 :ref-c0 :ref-c1)
+          (update :values (fn [rows] (mapv (fn [row] (mapv #(try (one %) (catch #?(:clj Exception :cljs :default) e
+                                                                           (if-let [c (:excel-error (ex-data e))] (val/error c) (throw e))))
+                                                           row))
+                                           rows))))
+      (one k))))
+
 (f/register! "LARGE"
              ;; the data is the first argument only: k is not a data point
              (fn [args]
-               (let [xs (vec (sort > (f/collect-finite-numerics [(first args)])))
-                     k  (long (f/num! (nth args 1)))]
-                 (if (or (<= k 0) (> k (count xs)))
-                   val/ERR-NUM
-                   (val/number (nth xs (dec k))))))
+               (let [xs (vec (sort > (f/collect-finite-numerics [(first args)])))]
+                 (kth-of xs (nth args 1))))
              :arity [2 2])
 
 (f/register! "SMALL"
              (fn [args]
-               (let [xs (vec (sort (f/collect-finite-numerics [(first args)])))
-                     k  (long (f/num! (nth args 1)))]
-                 (if (or (<= k 0) (> k (count xs)))
-                   val/ERR-NUM
-                   (val/number (nth xs (dec k))))))
+               (let [xs (vec (sort (f/collect-finite-numerics [(first args)])))]
+                 (kth-of xs (nth args 1))))
              :arity [2 2])
 
 ;; ---------------------------------------------------------------------------
@@ -738,7 +746,12 @@
           (recur (if (= c \~) (+ i 2) (inc i))))))
     (p/pattern-icase (p/sb->str sb))))
 
-(defn- parse-num-maybe [s] (p/parse-double s))
+(defn- parse-num-maybe
+  "The number text `s` reads as, as Excel reads it in criteria (\"1,000\",
+   \"50%\", a date such as \"3-1-21\"), or nil."
+  [s]
+  (when (re-find #"\d" s)
+    (let [n (val/to-num (val/string s))] (when (val/num? n) (:v n)))))
 
 (defn- parse-criterion
   "Decode a criterion cell into `[op rhs]` where op is :eq :ne :lt :le
@@ -909,98 +922,129 @@
           (boolean? c) (if c 1.0 0.0)
           :else nil)))
 
+(defn- with-criteria-array
+  "`f` over args whose criteria (at `positions`, a fn of the args) may be an
+   array: then one result per criterion, in the criteria's shape
+   (`per-criterion`), as Excel lifts SUMIF(S) and its family."
+  [positions f]
+  (fn [args]
+    (let [args (vec args) ps (positions args)]
+      (per-criterion (mapv #(nth args %) ps)
+                     (fn [crits] (f (reduce (fn [a [p c]] (assoc a p c)) args (map vector ps crits))))))))
+
+(defn- ifs-positions [args] (vec (range 2 (count args) 2)))
+
+(defn- sized-like
+  "A SUMIF/AVERAGEIF sum range `sum` as Excel reads it beside the criteria
+   range `rng`: from its top-left cell, the size of `rng`, so
+   SUMIF(A1:E17,c,B1:B17) sums B1:F17."
+  [rng sum]
+  (let [dims (fn [v] (if (f/area? v) [(count (:values v)) (count (first (:values v)))] [1 1]))
+        [h w] (dims rng)
+        top (cond (and (f/area? sum) (:sheet sum)) {:sheet (:sheet sum) :r0 (long (:r0 sum)) :c0 (long (:c0 sum))}
+                  (:ref sum) (let [{:keys [sheet row col]} (:ref sum)] {:sheet sheet :r0 (long row) :c0 (long col)}))]
+    (if (and top f/*read-area* (not= [h w] (dims sum)))
+      (f/*read-area* (assoc top :r1 (+ (:r0 top) (dec h)) :c1 (+ (:c0 top) (dec w))))
+      sum)))
+
 (f/register! "SUMIF"
   ;; SUMIF(range, criterion, [sum_range])
-             (fn [args]
-               (let [range-cells (area-cells (nth args 0))
-                     crit        (parse-criterion (nth args 1))
-                     sum-cells   (if (> (count args) 2)
-                                   (area-cells (nth args 2))
-                                   range-cells)
-                     total (volatile! 0.0)]
-                 (dotimes [i (count range-cells)]
-                   (when (and (< i (count sum-cells))
-                              (criterion-matches? (cell-val (nth range-cells i)) crit))
-                     (when-let [x (numeric-at sum-cells i)]
-                       (vswap! total + x))))
-                 (val/number @total)))
+             (with-criteria-array (constantly [1])
+               (fn [args]
+                 (let [range-cells (area-cells (nth args 0))
+                       crit        (parse-criterion (nth args 1))
+                       sum-cells   (if (> (count args) 2)
+                                     (area-cells (sized-like (nth args 0) (nth args 2)))
+                                     range-cells)
+                       total (volatile! 0.0)]
+                   (dotimes [i (count range-cells)]
+                     (when (and (< i (count sum-cells))
+                                (criterion-matches? (cell-val (nth range-cells i)) crit))
+                       (when-let [x (numeric-at sum-cells i)]
+                         (vswap! total + x))))
+                   (val/number @total))))
              :arity [2 3])
 
 (f/register! "SUMIFS"
   ;; SUMIFS(sum_range, crit_range1, crit1, crit_range2, crit2, ...)
-             (fn [args]
-               (let [sum-cells (area-cells (nth args 0))
-                     pairs     (partition 2 (drop 1 args))
-                     _ (when (not (even? (count (drop 1 args))))
-                         (f/domain-error! :value))
-                     indices   (ifs-indices pairs)
-                     total (volatile! 0.0)]
-                 (doseq [i indices]
-                   (when (< i (count sum-cells))
-                     (when-let [x (numeric-at sum-cells i)]
-                       (vswap! total + x))))
-                 (val/number @total)))
+             (with-criteria-array ifs-positions
+               (fn [args]
+                 (let [sum-cells (area-cells (nth args 0))
+                       pairs     (partition 2 (drop 1 args))
+                       _ (when (not (even? (count (drop 1 args))))
+                           (f/domain-error! :value))
+                       indices   (ifs-indices pairs)
+                       total (volatile! 0.0)]
+                   (doseq [i indices]
+                     (when (< i (count sum-cells))
+                       (when-let [x (numeric-at sum-cells i)]
+                         (vswap! total + x))))
+                   (val/number @total))))
              :arity [3 nil])
 
 (f/register! "AVERAGEIF"
-             (fn [args]
-               (let [range-cells (area-cells (nth args 0))
-                     crit        (parse-criterion (nth args 1))
-                     avg-cells   (if (> (count args) 2)
-                                   (area-cells (nth args 2))
-                                   range-cells)
-                     total (volatile! 0.0)
-                     n (volatile! 0)]
-                 (dotimes [i (count range-cells)]
-                   (when (and (< i (count avg-cells))
-                              (criterion-matches? (cell-val (nth range-cells i)) crit))
-                     (when-let [x (numeric-at avg-cells i)]
-                       (vswap! total + x)
-                       (vswap! n inc))))
-                 (if (zero? @n) val/ERR-DIV0
-                     (val/number (/ @total (double @n))))))
+             (with-criteria-array (constantly [1])
+               (fn [args]
+                 (let [range-cells (area-cells (nth args 0))
+                       crit        (parse-criterion (nth args 1))
+                       avg-cells   (if (> (count args) 2)
+                                     (area-cells (sized-like (nth args 0) (nth args 2)))
+                                     range-cells)
+                       total (volatile! 0.0)
+                       n (volatile! 0)]
+                   (dotimes [i (count range-cells)]
+                     (when (and (< i (count avg-cells))
+                                (criterion-matches? (cell-val (nth range-cells i)) crit))
+                       (when-let [x (numeric-at avg-cells i)]
+                         (vswap! total + x)
+                         (vswap! n inc))))
+                   (if (zero? @n) val/ERR-DIV0
+                       (val/number (/ @total (double @n)))))))
              :arity [2 3])
 
 (f/register! "AVERAGEIFS"
-             (fn [args]
-               (let [avg-cells (area-cells (nth args 0))
-                     pairs     (partition 2 (drop 1 args))
-                     _ (when (not (even? (count (drop 1 args))))
-                         (f/domain-error! :value))
-                     indices   (ifs-indices pairs)
-                     total (volatile! 0.0)
-                     n (volatile! 0)]
-                 (doseq [i indices]
-                   (when (< i (count avg-cells))
-                     (when-let [x (numeric-at avg-cells i)]
-                       (vswap! total + x)
-                       (vswap! n inc))))
-                 (if (zero? @n) val/ERR-DIV0
-                     (val/number (/ @total (double @n))))))
+             (with-criteria-array ifs-positions
+               (fn [args]
+                 (let [avg-cells (area-cells (nth args 0))
+                       pairs     (partition 2 (drop 1 args))
+                       _ (when (not (even? (count (drop 1 args))))
+                           (f/domain-error! :value))
+                       indices   (ifs-indices pairs)
+                       total (volatile! 0.0)
+                       n (volatile! 0)]
+                   (doseq [i indices]
+                     (when (< i (count avg-cells))
+                       (when-let [x (numeric-at avg-cells i)]
+                         (vswap! total + x)
+                         (vswap! n inc))))
+                   (if (zero? @n) val/ERR-DIV0
+                       (val/number (/ @total (double @n)))))))
              :arity [3 nil])
 
 (f/register! "MAXIFS"
-             (fn [args]
-               (let [max-cells (area-cells (nth args 0))
-                     pairs     (partition 2 (drop 1 args))
-                     indices   (ifs-indices pairs)
-                     vals (keep (fn [i] (when (< i (count max-cells))
-                                          (numeric-at max-cells i)))
-                                indices)]
-                 (if (empty? vals) (val/number 0.0)
-                     (val/number (apply max vals)))))
+             (with-criteria-array ifs-positions
+               (fn [args]
+                 (let [max-cells (area-cells (nth args 0))
+                       pairs     (partition 2 (drop 1 args))
+                       indices   (ifs-indices pairs)
+                       vals (keep (fn [i] (when (< i (count max-cells))
+                                            (numeric-at max-cells i)))
+                                  indices)]
+                   (if (empty? vals) (val/number 0.0)
+                       (val/number (apply max vals))))))
              :arity [3 nil])
 
 (f/register! "MINIFS"
-             (fn [args]
-               (let [min-cells (area-cells (nth args 0))
-                     pairs     (partition 2 (drop 1 args))
-                     indices   (ifs-indices pairs)
-                     vals (keep (fn [i] (when (< i (count min-cells))
-                                          (numeric-at min-cells i)))
-                                indices)]
-                 (if (empty? vals) (val/number 0.0)
-                     (val/number (apply min vals)))))
+             (with-criteria-array ifs-positions
+               (fn [args]
+                 (let [min-cells (area-cells (nth args 0))
+                       pairs     (partition 2 (drop 1 args))
+                       indices   (ifs-indices pairs)
+                       vals (keep (fn [i] (when (< i (count min-cells))
+                                            (numeric-at min-cells i)))
+                                  indices)]
+                   (if (empty? vals) (val/number 0.0)
+                       (val/number (apply min vals))))))
              :arity [3 nil])
 
 ;; ---------------------------------------------------------------------------

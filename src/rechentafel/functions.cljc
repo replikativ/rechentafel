@@ -119,6 +119,30 @@
 
 (declare lift-call area?)
 
+(defn refs?
+  "An array of references (OFFSET(A1:A9,,{1,2,3}) is three columns): the
+   areas in `:values`, a grid like an area's."
+  [v]
+  (= :refs (:t v)))
+
+(declare call)
+
+(defn- call-per-ref
+  "`fname` applied once per reference of the `:refs` arguments (the others
+   as they are), as Excel does: SUBTOTAL(9,OFFSET(B1:B9,,{0,1})) is one
+   total per column. `:refs` of different sizes broadcast as arrays do."
+  [fname args]
+  (let [rs (filter refs? args)
+        nr (reduce max (map #(count (:values %)) rs))
+        nc (reduce max (map #(count (first (:values %))) rs))
+        at (fn [v r c] (let [g (:values v)
+                             row (nth g (if (= 1 (count g)) 0 r) nil)]
+                         (or (nth row (if (= 1 (count row)) 0 c) nil) val/ERR-NA)))]
+    {:t :area :r0 0 :c0 0 :r1 (dec nr) :c1 (dec nc)
+     :values (mapv (fn [r] (mapv (fn [c] (call fname (mapv #(if (refs? %) (at % r c) %) args)))
+                                 (range nc)))
+                   (range nr))}))
+
 (defn call
   "Invoke the registered fn with `args` (already-evaluated values). Returns
   a value — either the fn's result or an Excel error. If the fn is not
@@ -132,6 +156,7 @@
   (if-let [{f :fn arity :arity lift? :lift?} (lookup fname)]
     (cond
       (not (arity-ok? arity (count args))) val/ERR-VALUE
+      (some refs? args) (call-per-ref fname args)
       :else
       (or (first-error args)
           (try
@@ -187,6 +212,12 @@
 
 (def ^:dynamic *current-cell* nil)
 
+(def ^:dynamic *read-area*
+  "While a formula is evaluated, a fn of {:sheet name :r0 :c0 :r1 :c1}: that
+   range of the workbook, for a function that reads past an argument (a
+   smaller SUMIF sum_range takes the size of its range)."
+  nil)
+
 (defn implicit-intersect
   "Project an :area value to a scalar using *current-cell*. Non-areas
   pass through."
@@ -239,8 +270,9 @@
   (get-in (:values a) [r c]))
 
 (defn- broadcast-shape
-  "Given two values, return [rows cols] of the result, or nil for
-  shape-incompatible. A nil dimension on a side means scalar."
+  "Given two values, return [rows cols] of the result (nil when both are
+  scalars): the larger of each dimension, as Excel sizes an operation on
+  arrays of different sizes (elements beyond the smaller are #N/A, `pick`)."
   [a b]
   (let [a-area? (area? a)
         b-area? (area? b)]
@@ -250,14 +282,8 @@
       (and b-area? (not a-area?)) (area-shape b)
       :else
       (let [[ra ca] (area-shape a)
-            [rb cb] (area-shape b)
-            rows (cond (= ra rb)            ra
-                       (= 1 ra)             rb
-                       (= 1 rb)             ra)
-            cols (cond (= ca cb)            ca
-                       (= 1 ca)             cb
-                       (= 1 cb)             ca)]
-        (when (and rows cols) [rows cols])))))
+            [rb cb] (area-shape b)]
+        [(max ra rb) (max ca cb)]))))
 
 (defn- pick
   "Read one cell from `v` at logical (r, c). For areas with a singleton
@@ -268,7 +294,10 @@
     (let [[rows cols] (area-shape v)
           rr (if (= 1 rows) 0 r)
           cc (if (= 1 cols) 0 c)]
-      (area-cell v rr cc))
+      ;; past the end of the smaller array: #N/A, as Excel
+      (if (or (>= rr rows) (>= cc cols))
+        val/ERR-NA
+        (area-cell v rr cc)))
     :else v))
 
 (defn lift-binop
@@ -306,19 +335,11 @@
   dimensions broadcast against any size; mismatched non-singleton
   dimensions return ::mismatch."
   [areas]
+  ;; the larger of each dimension (Excel): elements beyond an area's own
+  ;; size are #N/A (`pick`)
   (reduce (fn [[ra ca] a]
-            (let [[rb cb] (area-shape a)
-                  rows (cond (= ra rb) ra
-                             (= 1 ra)  rb
-                             (= 1 rb)  ra
-                             :else     ::mismatch)
-                  cols (cond (= ca cb) ca
-                             (= 1 ca)  cb
-                             (= 1 cb)  ca
-                             :else     ::mismatch)]
-              (if (or (= ::mismatch rows) (= ::mismatch cols))
-                (reduced ::mismatch)
-                [rows cols])))
+            (let [[rb cb] (area-shape a)]
+              [(max ra rb) (max ca cb)]))
           (area-shape (first areas))
           (rest areas)))
 
@@ -330,6 +351,23 @@
            (catch #?(:clj Throwable :cljs :default) e
              (or (some-> (ex-data e) :excel-error val/error)
                  val/ERR-VALUE))))))
+
+(defn lift-call-raw
+  "As `lift-call`, but `f` sees each element's values as they are, errors
+   included (IF picks per element: an error in the branch it does not
+   pick is not its result)."
+  [f args]
+  (let [areas (filter area? args)]
+    (if (empty? areas)
+      (f args)
+      (let [[rows cols] (broadcast-shape-of-areas areas)]
+        {:t :area :r0 0 :c0 0 :r1 (dec rows) :c1 (dec cols)
+         :values (vec (for [r (range rows)]
+                        (vec (for [c (range cols)]
+                               (let [args' (mapv #(pick % r c) args)]
+                                 (try (f args')
+                                      (catch #?(:clj Throwable :cljs :default) e
+                                        (or (some-> (ex-data e) :excel-error val/error) val/ERR-VALUE))))))))}))))
 
 (defn lift-call
   "Apply scalar `f` over a list of args. If any arg is an area, lift
