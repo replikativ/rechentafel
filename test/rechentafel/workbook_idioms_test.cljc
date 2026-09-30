@@ -7,6 +7,7 @@
                :cljs [cljs.test :refer-macros [deftest is testing]])
             [rechentafel.eval :as e]
             [rechentafel.cell :as c]
+            [rechentafel.mtv]
             [rechentafel.functions.all]))
 
 (defn- run
@@ -215,3 +216,25 @@
         wb (e/recalc (e/set-cell wb (c/pack 0 1 0) 10))
         wb (e/recalc (e/set-cell wb (c/pack 0 0 0) 5))]
     (is (near? 11 (:v (e/get-cell wb (c/pack 0 2 0)))))))
+
+(deftest a-column-written-cell-by-cell
+  (let [col (reduce (fn [col r] (rechentafel.mtv/col-put col r (if (< r 50) {:t :num :v (double r)} {:t :str :v (str r)})))
+                    (rechentafel.mtv/empty-column) (range 100))
+        older col
+        col (-> col
+                (rechentafel.mtv/col-put 10 {:t :str :v "x"})
+                (rechentafel.mtv/col-put 60 {:t :num :v 6.0})
+                (rechentafel.mtv/col-put 200 {:t :num :v 2.0}))]
+    (is (<= (count (:blocks older)) 2) "runs of one type are one block")
+    (is (= [9.0 "x" 11.0 "59" 6.0 "61"] (mapv #(:v (rechentafel.mtv/col-get col %)) [9 10 11 59 60 61])))
+    (is (= :blank (:t (rechentafel.mtv/col-get col 150))) "the gap")
+    (is (= 2.0 (:v (rechentafel.mtv/col-get col 200))))
+    (is (= [10.0 "60"] (mapv #(:v (rechentafel.mtv/col-get older %)) [10 60])) "the older version is unchanged")
+    (is (== (reduce + (range 50)) (rechentafel.mtv/col-reduce-num older (fn [a x] (+ a x)) 0.0)))))
+
+(deftest blanking-a-run-from-the-top
+  (let [full (reduce (fn [col r] (rechentafel.mtv/col-put col r {:t :str :v (str r)})) (rechentafel.mtv/empty-column) (range 1000))
+        col (reduce (fn [col r] (rechentafel.mtv/col-put col r {:t :blank})) full (range 0 998))]
+    (is (= [:blank :blank "998" "999"] (mapv #(let [v (rechentafel.mtv/col-get col %)] (if (= :blank (:t v)) :blank (:v v))) [0 997 998 999])))
+    (is (<= (count (:blocks col)) 2) "the blanks are one block, the rest a view of the old run")
+    (is (= "500" (:v (rechentafel.mtv/col-get full 500))) "the old column is unchanged")))
