@@ -196,3 +196,22 @@
   (let [wb (recalc-cells [[0 5 "=E2*10"] [0 4 "=SEQUENCE(3)"] [5 5 "=SUM(E1:E3)"]])]
     (is (near? 20 (:v (e/get-cell wb (c/pack 0 0 5)))) "computed after the spill, in the same recalc")
     (is (near? 6 (:v (e/get-cell wb (c/pack 0 5 5)))))))
+
+(deftest lookups-do-not-cross-types
+  (is (= :na (run [[0 0 1] [1 0 2]] "=MATCH(\"1\",A1:A2,0)")) "text is not a number")
+  (is (= :na (run [[0 0 "1"]] "=MATCH(1,A1:A2,0)")))
+  (is (= :na (run [[1 0 "x"]] "=MATCH(\"\",A1:A2,0)")) "\"\" is not an empty cell")
+  (is (= :na (run [[0 0 "a"] [0 1 1]] "=VLOOKUP(\"\",A1:B2,2,0)"))))
+
+(deftest edits-reach-whole-column-readers
+  (let [wb (recalc-cells [[0 0 "=SUM(B:B)"] [0 2 "=COUNTA(3:3)"] [0 3 "=SUM(A:XFD)-A1-C1"]])
+        wb (e/recalc (-> wb (e/set-cell (c/pack 0 5000 1) 7) (e/set-cell (c/pack 0 2 16000) "x")))
+        v #(:v (e/get-cell wb (c/pack 0 0 %)))]
+    (is (near? 7 (v 0)) "a cell deep in the column")
+    (is (near? 1 (v 2)) "a cell far along the row")
+    (is (near? 7 (v 3)) "the whole sheet"))
+  (let [wb (recalc-cells [[0 0 1] [1 0 "=A1*2"] [2 0 "=A2+1"]])
+        ;; a formula overwritten by a value, then its input edited
+        wb (e/recalc (e/set-cell wb (c/pack 0 1 0) 10))
+        wb (e/recalc (e/set-cell wb (c/pack 0 0 0) 5))]
+    (is (near? 11 (:v (e/get-cell wb (c/pack 0 2 0)))))))

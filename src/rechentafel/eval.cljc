@@ -39,6 +39,9 @@
 (def ^:const ^:private sector-bits 6) ;; 64x64 — ~16k cells per sector
 (def ^:const ^:private sector-size 64)
 
+(def ^:private max-row 1048575)
+(def ^:private max-col 16383)
+
 (defn- sec-r ^long [^long r] (bit-shift-right r sector-bits))
 (defn- sec-c ^long [^long c] (bit-shift-right c sector-bits))
 
@@ -50,11 +53,19 @@
   (let [s0  (long sheet)
         s1  (long (or sheet-end sheet))
         sr0 (sec-r (long r0)) sr1 (sec-r (long r1))
-        sc0 (sec-c (long c0)) sc1 (sec-c (long c1))]
-    (for [s  (range s0 (inc s1))
-          sr (range sr0 (inc sr1))
-          sc (range sc0 (inc sc1))]
-      [s sr sc])))
+        sc0 (sec-c (long c0)) sc1 (sec-c (long c1))
+        ;; a range to the last row (A:A, A2:A1048576) is one key per column
+        ;; sector, to the last column one per row sector, not 16k sectors
+        ;; each: `formulas-reading-cell` looks these up too
+        to-last-row? (>= (long r1) (long max-row))
+        to-last-col? (>= (long c1) (long max-col))]
+    (for [s (range s0 (inc s1))
+          k (cond
+              (and to-last-row? to-last-col?) [[s :all]]
+              to-last-row? (for [sc (range sc0 (inc sc1))] [s :col sc])
+              to-last-col? (for [sr (range sr0 (inc sr1))] [s :row sr])
+              :else (for [sr (range sr0 (inc sr1)) sc (range sc0 (inc sc1))] [s sr sc]))]
+      k)))
 
 (defn- range-contains-cell? [{:keys [sheet sheet-end r0 r1 c0 c1]}
                              ^long cell-sheet ^long r ^long c]
@@ -281,9 +292,6 @@
 ;; A single-cell ref is a 1x1 range. Whole-col/row refs become sheet-wide
 ;; ranges. The sector index makes even A:A cheap — ~1000 sectors for a
 ;; 1M-row column, not 1M rdep entries.
-
-(def ^:private max-row 1048575)
-(def ^:private max-col 16383)
 
 (defn- last-sheet-idx
   "If the ref carries a :last-sheet (3D Sheet1:Sheet3 form), resolve it
@@ -537,9 +545,28 @@
     ;; and the formulas' cells, which a recalc writes only at its end
     [(max (long mr) (long (or fr 0))) (max (long mc) (long (or fc 0)))]))
 
+(def ^:dynamic ^:private *slab-cache*
+  "During a recalc, `{:stable #{sheet} :cache volatile-map}`: blocks read
+  off sheets no formula of the recalc writes to, which cannot change
+  while it runs, are read once (153 VLOOKUPs over Hrs!A:B read it once)."
+  nil)
+
+(declare materialise-slab*)
+
 (defn- materialise-slab
   "Read one [r0..r1, c0..c1] block off `sheet` as a vec-of-vec of
   tagged values, with whole-col / whole-row clipping baked in."
+  [wb s ref-r0 ref-r1 ref-c0 ref-c1]
+  (let [c *slab-cache*]
+    (if (and c (contains? (:stable c) (long s)))
+      (let [k [(long s) (long ref-r0) (long ref-r1) (long ref-c0) (long ref-c1)]]
+        (or (get @(:cache c) k)
+            (let [v (materialise-slab* wb s ref-r0 ref-r1 ref-c0 ref-c1)]
+              (vswap! (:cache c) assoc k v)
+              v)))
+      (materialise-slab* wb s ref-r0 ref-r1 ref-c0 ref-c1))))
+
+(defn- materialise-slab*
   [wb s ref-r0 ref-r1 ref-c0 ref-c1]
   (let [s      (long s)
         ref-r0 (long ref-r0) ref-r1 (long ref-r1)
@@ -970,40 +997,51 @@
 
 (defn- formulas-reading-cell
   "Which formulas read the given cell? Walks the sector the cell belongs
-  to, then precision-filters each candidate against its stored ranges."
-  [wb ^long cell-id]
-  (let [cs (cell/sheet cell-id)
-        cr (cell/row cell-id)
-        cc (cell/col cell-id)
-        sec [(long cs) (sec-r cr) (sec-c cc)]
-        candidates (get (:sector-rdeps wb) sec)]
-    (when (seq candidates)
-      (filter (fn [fid]
-                (some #(range-contains-cell? % cs cr cc)
-                      (get (:reads wb) fid)))
-              candidates))))
+  to, then precision-filters each candidate against its stored ranges
+  (those not in `skip`)."
+  ([wb cell-id] (formulas-reading-cell wb cell-id #{}))
+  ([wb ^long cell-id skip]
+   (let [cs (cell/sheet cell-id)
+         cr (cell/row cell-id)
+         cc (cell/col cell-id)
+         srd (:sector-rdeps wb)
+         candidates (distinct
+                     (concat (get srd [(long cs) (sec-r cr) (sec-c cc)])
+                             (get srd [(long cs) :col (sec-c cc)])
+                             (get srd [(long cs) :row (sec-r cr)])
+                             (get srd [(long cs) :all])))]
+     (when (seq candidates)
+       (filter (fn [fid]
+                 (and (not (contains? skip fid))
+                      (some #(range-contains-cell? % cs cr cc)
+                            (get (:reads wb) fid))))
+               candidates)))))
 
 (declare array-rect)
 
 (defn- transitive-dirty
   "Starting from `seed` cells, walk the reverse-dependency graph and
-  return every formula-id whose transitive inputs include a seed cell."
-  [wb seed]
-  (loop [dirty #{} stack (vec seed)]
-    (if (empty? stack)
-      dirty
-      (let [cid (peek stack)
-            readers (concat (formulas-reading-cell wb cid)
+  return every formula-id whose transitive inputs include a seed cell.
+  The walk stops at formulas in `known`, a dirty set, which holds their
+  downstream already (set-cell adds a cell's whole downstream; only a
+  recalc clears it): loading a workbook cell by cell stays linear."
+  ([wb seed] (transitive-dirty wb seed #{}))
+  ([wb seed known]
+   (loop [dirty #{} stack (vec (remove known seed))]
+     (if (empty? stack)
+       dirty
+       (let [cid (peek stack)
+             readers (concat (formulas-reading-cell wb cid known)
                             ;; an array anchor writes its whole rectangle
-                            (when-let [{:keys [sheet r0 c0 r1 c1]} (array-rect wb cid)]
-                              (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))
-                                    :let [id (cell/pack sheet r c)] :when (not= id cid)
-                                    f (formulas-reading-cell wb id)]
-                                f)))
-            fresh   (reduce (fn [acc f]
-                              (if (contains? dirty f) acc (conj acc f)))
-                            [] readers)]
-        (recur (into dirty fresh) (into (pop stack) fresh))))))
+                             (when-let [{:keys [sheet r0 c0 r1 c1]} (array-rect wb cid)]
+                               (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))
+                                     :let [id (cell/pack sheet r c)] :when (not= id cid)
+                                     f (formulas-reading-cell wb id)]
+                                 f)))
+             fresh   (reduce (fn [acc f]
+                               (if (or (contains? dirty f) (contains? known f)) acc (conj acc f)))
+                             [] readers)]
+         (recur (into dirty fresh) (into (pop stack) fresh)))))))
 
 (defn- spill-anchors-touching
   "Return the set of spill anchor-ids whose rectangle contains
@@ -1022,6 +1060,15 @@
 
 (defn- formula-input? [input]
   (and (string? input) (str/starts-with? input "=")))
+
+(defn- downstream
+  "The formulas to mark dirty below cell `id`, given the dirty set `d`: none
+   when every formula is dirty already (a workbook being loaded; `:dirty`
+   holds formula ids only), else the walk from `id`."
+  [wb ^long id d]
+  (if (>= (count d) (count (:formulas wb)))
+    #{}
+    (transitive-dirty wb [id] d)))
 
 (defn set-cell
   "Set a cell. `input` can be:
@@ -1078,7 +1125,7 @@
                           (update :dirty
                                   (fn [d] (-> d (conj id)
                                               (into touched-anchors)
-                                              (into (transitive-dirty wb [id]))))))]
+                                              (into (downstream wb id d))))))]
           wb)
         (-> wb
             (remove-reads id)
@@ -1086,9 +1133,9 @@
             (update :volatile disj id)
             (put-cell-value id literal-v)
             (update :dirty
-                    (fn [d] (-> d
+                    (fn [d] (-> (disj d id)
                                 (into touched-anchors)
-                                (into (transitive-dirty wb [id]))))))))))
+                                (into (downstream wb id d))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Recompute — topo-sort the dirty set (restricted to formulas) and eval.
@@ -1543,6 +1590,8 @@
                  wb)
         nodes  (vec (dirty-formulas wb))
         {:keys [order cycle]} (topo-order wb nodes)
+        written (into #{} (map #(long (cell/sheet %))) nodes)
+        cache {:stable (into #{} (remove written) (range (count (:sheets wb)))) :cache (volatile! {})}
         ;; Two-phase recalc:
         ;;   1. Walk topo order, eval each formula against wb + :pending
         ;;      (a transient map of in-flight writes). Writes don't touch
@@ -1552,13 +1601,14 @@
         ;;      the `A1#` operator see the live shape. Formulas in a static
         ;;      cycle then compute on demand (`on-demand-values`).
         ;;   2. Flush :pending into :sheets in one bulk per-column pass.
-        [pending wb] (reduce (fn [acc ^long id] (write-result acc id (eval-formula (second acc) (first acc) id)))
-                             [(transient {}) wb] order)
+        [pending wb] (binding [*slab-cache* cache]
+                       (reduce (fn [acc ^long id] (write-result acc id (eval-formula (second acc) (first acc) id)))
+                               [(transient {}) wb] order))
         [pending wb] (if (seq cycle)
                        (let [p (persistent! pending)]
                          (reduce (fn [acc [id v]] (write-result acc id v))
                                  [(transient p) wb]
-                                 (on-demand-values wb p cycle)))
+                                 (binding [*slab-cache* cache] (on-demand-values wb p cycle))))
                        [pending wb])
         sheets   (flush-pending (:sheets wb) (persistent! pending))]
     (assoc wb :sheets sheets :dirty #{})))

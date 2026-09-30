@@ -35,8 +35,9 @@
 ;; Equality + ordering used by VLOOKUP/HLOOKUP/MATCH
 
 (defn- values-equal?
-  "POI-compatible equality for lookup comparisons. Case-insensitive for
-  strings, numeric-equal for numbers, same-error for errors."
+  "Equality for lookup comparisons, as Excel's: case-insensitive for
+  strings, numeric-equal for numbers, same-error for errors, never across
+  types."
   [a b]
   (cond
     (and (val/err? a) (val/err? b)) (= (:v a) (:v b))
@@ -45,11 +46,8 @@
     (and (val/bool? a) (val/bool? b)) (= (:v a) (:v b))
     (and (val/str? a) (val/str? b))
     (= (str/lower-case (:v a)) (str/lower-case (:v b)))
-    ;; cross-type: coerce right toward left's type (POI's loose match)
-    (val/num? a) (let [n (val/to-num b)] (and (val/num? n) (== (:v a) (:v n))))
-    (val/str? a) (let [s (val/to-str b)] (and (val/str? s)
-                                              (= (str/lower-case (:v a))
-                                                 (str/lower-case (:v s)))))
+    ;; as Excel's lookups: text never equals a number ("1" is not 1), and
+    ;; "" is not an empty cell (MATCH("",A:A,0) finds none)
     :else false))
 
 (defn- compare-values
