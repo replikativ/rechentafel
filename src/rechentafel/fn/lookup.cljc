@@ -146,11 +146,14 @@
         cols (count (first rows))]
     (when (or (neg? col-idx) (>= col-idx cols)) (f/domain-error! :ref))
     (if exact?
-      (or (some (fn [row]
-                  (when (values-equal? target (first row))
-                    (nth row col-idx)))
-                rows)
-          val/ERR-NA)
+      ;; text may hold wildcards (* ? ~), as in MATCH type 0
+      (let [wild? (val/str? target)]
+        (or (some (fn [row]
+                    (when (or (values-equal? target (first row))
+                              (and wild? (val/str? (first row)) (wildcard-match? (:v target) (:v (first row)))))
+                      (nth row col-idx)))
+                  rows)
+            val/ERR-NA))
       ;; approximate match: largest first-column value <= target
       (let [best (volatile! nil)]
         (doseq [row rows]
@@ -228,7 +231,13 @@
              (fn [args]
                (let [arr (nth args 0)
                      rows (area-rows arr)
-                     [nrows ncols] [(count rows) (count (first rows))]
+                     ;; a whole column/row (B:B) is clipped to the used cells;
+                     ;; INDEX counts over the reference, so a row past them
+                     ;; is an empty cell, not #REF!
+                     [nrows ncols] [(if (:ref-r1 arr) (inc (- (long (:ref-r1 arr)) (long (:ref-r0 arr)))) (count rows))
+                                    (if (:ref-c1 arr) (inc (- (long (:ref-c1 arr)) (long (:ref-c0 arr)))) (count (first rows)))]
+                     ;; a cell past the used ones is empty
+                     cell-at (fn [r c] (get-in rows [r c] val/BLANK))
                      ;; one index into a one-row array counts along the row
                      ;; (INDEX({"a","b","c"},2) is "b"), as in Excel
                      along-row? (and (= 2 (count args)) (= 1 nrows) (> ncols 1))
@@ -256,7 +265,7 @@
                               :values [(nth rows (dec rn))]}
                        ref? (assoc :sheet (:sheet arr)))
                      :else
-                     (cond-> (nth (nth rows (dec rn)) (dec cn))
+                     (cond-> (cell-at (dec rn) (dec cn))
                        ref? (assoc :ref {:sheet (:sheet arr) :row (+ br (dec rn)) :col (+ bc (dec cn))}))))))
              :arity [2 4])
 

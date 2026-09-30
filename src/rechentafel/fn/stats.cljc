@@ -221,23 +221,31 @@
 ;; ---------------------------------------------------------------------------
 ;; LARGE / SMALL
 
+(defn- kth-of
+  "The k-th of sorted `xs`; an array of k gives an array of results (in
+   k's shape), as SMALL(r,{1;2;3}) in Excel."
+  [xs k]
+  (let [one (fn [kv] (let [k (long (f/num! kv))]
+                       (if (or (<= k 0) (> k (count xs))) val/ERR-NUM (val/number (nth xs (dec k))))))]
+    (if (and (f/area? k) (> (count (apply concat (:values k))) 1))
+      (-> (dissoc k :sheet :ref-r0 :ref-r1 :ref-c0 :ref-c1)
+          (update :values (fn [rows] (mapv (fn [row] (mapv #(try (one %) (catch #?(:clj Exception :cljs :default) e
+                                                                           (if-let [c (:excel-error (ex-data e))] (val/error c) (throw e))))
+                                                           row))
+                                           rows))))
+      (one k))))
+
 (f/register! "LARGE"
              ;; the data is the first argument only: k is not a data point
              (fn [args]
-               (let [xs (vec (sort > (f/collect-finite-numerics [(first args)])))
-                     k  (long (f/num! (nth args 1)))]
-                 (if (or (<= k 0) (> k (count xs)))
-                   val/ERR-NUM
-                   (val/number (nth xs (dec k))))))
+               (let [xs (vec (sort > (f/collect-finite-numerics [(first args)])))]
+                 (kth-of xs (nth args 1))))
              :arity [2 2])
 
 (f/register! "SMALL"
              (fn [args]
-               (let [xs (vec (sort (f/collect-finite-numerics [(first args)])))
-                     k  (long (f/num! (nth args 1)))]
-                 (if (or (<= k 0) (> k (count xs)))
-                   val/ERR-NUM
-                   (val/number (nth xs (dec k))))))
+               (let [xs (vec (sort (f/collect-finite-numerics [(first args)])))]
+                 (kth-of xs (nth args 1))))
              :arity [2 2])
 
 ;; ---------------------------------------------------------------------------

@@ -96,3 +96,13 @@
   (is (= "c" (run [] "=INDEX(TEXTSPLIT(\"a,b;c,d\",\",\",\";\"),2,1)")))
   (is (near? 6 (run [] "=_xlfn.LET(_xlpm.w,5,_xlpm.w+1)")) "LET as stored in a file")
   (is (near? 1 (run [] "=_xlfn.LET(_xlpm.t,_xlfn.TEXTSPLIT(\"xa, yb, zc\",\", \"),_xlpm.ft,_xlfn._xlws.FILTER(_xlpm.t,(LEFT(_xlpm.t,1)<>\"x\")*(LEFT(_xlpm.t,1)<>\"z\"),\"\"),SUM(IF(_xlpm.ft=\"\",0,1)))"))))
+
+(deftest arrays-in-if-and-lookups
+  (is (near? 4 (run [[0 0 1] [1 0 "=1/0"] [2 0 3]] "=SUM(IF(ISERROR(A1:A3),\"\",A1:A3))"))
+      "IF takes each element's branch; an error in the other one is not its result")
+  (is (near? 3 (run [[0 0 "Yes"] [1 0 "No"] [2 0 "Yes"]] "=AGGREGATE(15,6,ROW(A1:A5)/(A1:A3=\"Yes\"),2)"))
+      "arrays of different sizes: #N/A beyond the smaller, ignored")
+  (is (near? 0 (run [[0 1 5]] "=INDEX(B:B,3)")) "a whole column counts past its used cells")
+  (is (near? 9 (run [[0 0 "Apple pie"] [0 1 9]] "=VLOOKUP(\"App\"&\"*\",A1:B1,2,0)")) "VLOOKUP wildcards")
+  (is (near? 14 (run [] "=SUM(10^{2;1;0}*SMALL({4;1;0},{1;2;3}))")) "SMALL with an array of k"))
+

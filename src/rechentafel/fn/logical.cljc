@@ -112,7 +112,7 @@
                      then-v #(if (>= (count ast-args) 2) (eval1 ctx (nth ast-args 1)) val/TRUE)
                      else-v #(if (>= (count ast-args) 3) (eval1 ctx (nth ast-args 2)) val/FALSE)]
                  (cond
-                   (f/area? cond-v) (f/lift-call pick-if [cond-v (then-v) (else-v)])
+                   (f/area? cond-v) (f/lift-call-raw pick-if [cond-v (then-v) (else-v)])
                    (val/err? cond-v) cond-v
                    (val/truthy? cond-v) (then-v)
                    :else (else-v))))
