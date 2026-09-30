@@ -464,13 +464,17 @@
              (fn [args]
                (let [n (long (f/num! (nth args 0)))
                      k (long (f/num! (nth args 1)))]
-                 (when (or (neg? n) (neg? k)) (f/domain-error! :num))
+                 ;; Excel's documented constraint, which LibreOffice enforces:
+                 ;; 0 <= number_chosen <= number (after truncation), else #NUM!.
+                 ;; COMBINA(0, 0) is 0 there (Excel's own value unverified).
+                 (when (or (neg? n) (neg? k) (> k n)) (f/domain-error! :num))
                  (let [n' (+ n k -1)
                        k' (min k (- n' k))
                        r  (loop [i 0, acc 1.0]
-                            (if (= i k') acc
+                            ;; >=: a negative bound (n = 0) cannot run away
+                            (if (>= i k') acc
                                 (recur (inc i) (/ (* acc (double (- n' i))) (double (inc i))))))]
-                   (val/number (f/check-num! r)))))
+                   (val/number (if (zero? n) 0.0 (f/check-num! r))))))
              :arity [2 2])
 
 (f/register! "PERMUT"
