@@ -746,7 +746,12 @@
           (recur (if (= c \~) (+ i 2) (inc i))))))
     (p/pattern-icase (p/sb->str sb))))
 
-(defn- parse-num-maybe [s] (p/parse-double s))
+(defn- parse-num-maybe
+  "The number text `s` reads as, as Excel reads it in criteria (\"1,000\",
+   \"50%\", a date such as \"3-1-21\"), or nil."
+  [s]
+  (when (re-find #"\d" s)
+    (let [n (val/to-num (val/string s))] (when (val/num? n) (:v n)))))
 
 (defn- parse-criterion
   "Decode a criterion cell into `[op rhs]` where op is :eq :ne :lt :le

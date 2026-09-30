@@ -196,6 +196,15 @@
                      (boolean (some ast-has-volatile? (:args ast))))
     false))
 
+(defn- sheet-index
+  "The index of the sheet named `n` (as Excel, ignoring case), or nil."
+  [wb n]
+  (let [names (:sheet-names wb)]
+    (or (get names n)
+        (when (string? n)
+          (let [u (str/upper-case n)]
+            (some (fn [[k i]] (when (= u (str/upper-case k)) i)) names))))))
+
 (defn- sheet-idx
   "Resolve ref-node's :sheet qualifier to an integer index. Returns nil
   for an unknown sheet name — callers treat that as #REF!.
@@ -217,7 +226,7 @@
     (:workbook ref-node)
     (get (:external-sheets wb) [(str (:workbook ref-node)) (str/upper-case (str (:sheet ref-node)))])
     (:sheet ref-node)
-    (get (:sheet-names wb) (:sheet ref-node))
+    (sheet-index wb (:sheet ref-node))
     :else
     (long (or (:sheet functions/*current-cell*)
               (:cur-sheet wb 0)))))
@@ -282,7 +291,7 @@
   refs returns nil."
   [wb r]
   (when-let [end (:last-sheet r)]
-    (get (:sheet-names wb) end)))
+    (sheet-index wb end)))
 
 (defn- ref->range [wb r]
   (when-let [s (sheet-idx wb r)]
@@ -592,7 +601,7 @@
    tagged with :ref) is where it is; else nil."
   [wb node]
   (let [v (eval-ast wb node)
-        sheet-of #(when % (get (:sheet-names wb) %))]
+        sheet-of #(when % (sheet-index wb %))]
     (cond
       (and (= :area (:t v)) (:sheet v))
       (when-let [s (sheet-of (:sheet v))]
@@ -712,14 +721,16 @@
    cell's value tagged with where it is. Without a sheet name, the sheet
    of the formula."
   [wb coords]
-  (let [s  (or (when-let [n (:sheet coords)] (get (:sheet-names wb) n))
-               (:sheet functions/*current-cell*)
-               (:cur-sheet wb 0))
+  (let [s  (if-let [n (:sheet coords)]
+             (sheet-index wb n)
+             (or (:sheet functions/*current-cell*) (:cur-sheet wb 0)))
         r0 (long (:r0 coords))
         r1 (long (:r1 coords))
         c0 (long (:c0 coords))
         c1 (long (:c1 coords))]
     (cond
+      ;; a sheet the workbook does not have
+      (nil? s) val/ERR-REF
       (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
       val/ERR-REF
       ;; a single cell's value, tagged with where it is, so
@@ -1421,7 +1432,22 @@
   [wb]
   (binding [rng/*rng* (when-let [seed (:rng-seed wb)]
                         (rng/make (long seed)))]
-    (recalc-impl wb)))
+    ;; A formula reading a spilled cell depends on the anchor only once the
+    ;; spill is known: on a fresh workbook (or when a spill changes shape)
+    ;; it may have run first. Recompute what reads the cells whose spill
+    ;; changed, now in order, until the spills settle.
+    (loop [before (:spills wb) wb (recalc-impl wb true) round 0]
+      (let [after (:spills wb)
+            changed (for [k (distinct (concat (keys before) (keys after)))
+                          :when (not= (get before k) (get after k))
+                          {:keys [r0 c0 r1 c1]} (keep identity [(get before k) (get after k)])
+                          r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))
+                          :let [id (cell/pack (cell/sheet k) r c)] :when (not= id k)]
+                      id)
+            readers (when (seq changed) (transitive-dirty wb (distinct changed)))]
+        (if (and (seq readers) (< round 8))
+          (recur after (recalc-impl (update wb :dirty into readers) false) (inc round))
+          wb)))))
 
 (defn- eval-formula
   "The value formula `id` computes against `wb` (in-flight writes in
@@ -1508,11 +1534,13 @@
           (when (and (pos? changed) (< round (count ids))) (recur (inc round))))))
     (mapv (fn [id] [id (get @done id)]) ids)))
 
-(defn- recalc-impl [wb]
-  (let [wb     (update wb :dirty
-                       (fn [d]
-                         (let [seeded (into d (:volatile wb))]
-                           (into seeded (transitive-dirty wb (:volatile wb))))))
+(defn- recalc-impl [wb seed-volatile?]
+  (let [wb     (if seed-volatile?
+                 (update wb :dirty
+                         (fn [d]
+                           (let [seeded (into d (:volatile wb))]
+                             (into seeded (transitive-dirty wb (:volatile wb))))))
+                 wb)
         nodes  (vec (dirty-formulas wb))
         {:keys [order cycle]} (topo-order wb nodes)
         ;; Two-phase recalc:

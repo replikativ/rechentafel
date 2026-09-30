@@ -177,3 +177,22 @@
     (is (near? 4 (v 2)))
     (is (= :ref (v 3)) "a book the file does not cache")
     (is (near? 1 (v 4)) "not one of the workbook's sheets")))
+
+(deftest sheet-names-ignore-case
+  (let [wb (-> (e/empty-workbook ["Main" "Jan"])
+               (e/set-cell (c/pack 1 0 0) 3)
+               (e/set-cell (c/pack 0 0 0) "=jan!A1+INDIRECT(\"JAN!A1\")")
+               (e/set-cell (c/pack 0 1 0) "=INDIRECT(\"Nope!A1\")")
+               e/recalc)]
+    (is (near? 6 (:v (e/get-cell wb (c/pack 0 0 0)))))
+    (is (= :ref (:v (e/get-cell wb (c/pack 0 1 0)))) "a sheet the workbook does not have")))
+
+(deftest criteria-read-text-as-excel-does
+  (let [d [[0 0 "3-1-21"] [1 0 "3-2-21"] [2 0 44256] [0 1 1] [1 1 2] [2 1 4]]]
+    (is (near? 5 (run d "=SUMIFS(B1:B3,A1:A3,DATE(2021,3,1))")) "date text matches the date")
+    (is (near? 2 (run [[0 0 "1,000"] [1 0 1000]] "=COUNTIF(A1:A2,1000)")))))
+
+(deftest a-reader-of-a-spill-follows-it
+  (let [wb (recalc-cells [[0 5 "=E2*10"] [0 4 "=SEQUENCE(3)"] [5 5 "=SUM(E1:E3)"]])]
+    (is (near? 20 (:v (e/get-cell wb (c/pack 0 0 5)))) "computed after the spill, in the same recalc")
+    (is (near? 6 (:v (e/get-cell wb (c/pack 0 5 5)))))))
