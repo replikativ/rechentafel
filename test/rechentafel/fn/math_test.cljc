@@ -183,3 +183,12 @@
   (is (= v/ERR-VALUE (f/call "PI" [(n 1)])))
   ;; unknown fn
   (is (= v/ERR-NAME  (f/call "NOPE" [(n 1)]))))
+
+(deftest combina-returns-for-every-argument
+  ;; issue #2: COMBINA(0, k) looped forever. LibreOffice as the oracle
+  ;; (Excel's documented constraint 0 <= number_chosen <= number):
+  (is (n= 0.0 (f/call "COMBINA" [(n 0) (n 0)])))
+  (is (= {:t :err :v :num} (f/call "COMBINA" [(n 0) (n 2)])))
+  (is (= {:t :err :v :num} (f/call "COMBINA" [(n 0.5) (n 2)])) "0.5 truncates to 0")
+  (is (= {:t :err :v :num} (f/call "COMBINA" [(n 1) (n 2)])) "number_chosen above number")
+  (is (n= 20.0 (f/call "COMBINA" [(n 4) (n 3)]))))
