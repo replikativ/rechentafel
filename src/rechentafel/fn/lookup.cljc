@@ -81,6 +81,28 @@
         re  (re-pattern (str "^" pat "$"))]
     (boolean (re-matches re tgt))))
 
+;; Excel's approximate search looks only at values of the target's type:
+;; errors, blanks and other types are skipped, so MATCH(2,1/(cond)) finds
+;; the last match
+(defn- same-kind? [target v]
+  (cond (val/num? target) (val/num? v)
+        (val/str? target) (val/str? v)
+        (val/bool? target) (val/bool? v)
+        :else false))
+
+(defn- approx-position
+  "The 1-based position a binary search over `flat` ([idx cell] pairs)
+   lands on for `target`, stepping right while `(ok? (compare v target) 0)`;
+   #N/A when there is none."
+  [flat target ok?]
+  (let [vs (filterv #(same-kind? target (second %)) flat)
+        l (loop [l 0 r (count vs)]
+            (if (< l r)
+              (let [m (quot (+ l r) 2)]
+                (if (ok? (compare-values (second (nth vs m)) target) 0) (recur (inc m) r) (recur l m)))
+              l))]
+    (if (zero? l) val/ERR-NA (val/number (double (inc (first (nth vs (dec l)))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; MATCH
 
@@ -119,22 +141,8 @@
                    ;; binary_search): on sorted data the position of the
                    ;; largest value <= target; on unsorted data wherever the
                    ;; search lands, not a linear scan's answer
-                     1 (let [vs (mapv second flat)
-                             n (count vs)
-                             l (loop [l 0 r n]
-                                 (if (< l r)
-                                   (let [m (quot (+ l r) 2)]
-                                     (if (<= (compare-values (nth vs m) target) 0) (recur (inc m) r) (recur l m)))
-                                   l))]
-                         (if (zero? l) val/ERR-NA (val/number (double l))))
-                     -1 (let [vs (mapv second flat)
-                              n (count vs)
-                              l (loop [l 0 r n]
-                                  (if (< l r)
-                                    (let [m (quot (+ l r) 2)]
-                                      (if (>= (compare-values (nth vs m) target) 0) (recur (inc m) r) (recur l m)))
-                                    l))]
-                          (if (zero? l) val/ERR-NA (val/number (double l))))
+                     1 (approx-position flat target <=)
+                     -1 (approx-position flat target >=)
                      (f/domain-error! :value)))))
              :arity [2 3])
 
@@ -154,12 +162,9 @@
                       (nth row col-idx)))
                   rows)
             val/ERR-NA))
-      ;; approximate match: largest first-column value <= target
-      (let [best (volatile! nil)]
-        (doseq [row rows]
-          (when (<= (compare-values (first row) target) 0)
-            (vreset! best row)))
-        (if-let [row @best] (nth row col-idx) val/ERR-NA)))))
+      ;; approximate match: the binary search over the first column
+      (let [pos (approx-position (map-indexed (fn [i row] [i (first row)]) rows) target <=)]
+        (if (val/err? pos) pos (nth (nth rows (dec (long (:v pos)))) col-idx))))))
 
 (f/register! "VLOOKUP"
              (fn [args]
@@ -194,14 +199,9 @@
                  (if result
         ;; Vector form: search row-or-column of a, return matching pos in result.
                    (let [search (if (= 1 (count a)) (first a) (mapv first a))
-                         best (volatile! nil)
-                         result-vec (if (= 1 (count result)) (first result) (mapv first result))]
-                     (doseq [[i v] (map-indexed vector search)]
-                       (when (<= (compare-values v target) 0)
-                         (vreset! best i)))
-                     (if-let [i @best]
-                       (nth result-vec i val/ERR-NA)
-                       val/ERR-NA))
+                         result-vec (if (= 1 (count result)) (first result) (mapv first result))
+                         pos (approx-position (map-indexed vector search) target <=)]
+                     (if (val/err? pos) pos (nth result-vec (dec (long (:v pos))) val/ERR-NA)))
         ;; Array form: 2-D → pick last column/row as the result.
                    (let [rows (count a)
                          cols (count (first a))
@@ -213,13 +213,8 @@
                          last-series (if horizontal?
                                        (last a)
                                        (mapv last a))
-                         best (volatile! nil)]
-                     (doseq [[i v] (map-indexed vector search)]
-                       (when (<= (compare-values v target) 0)
-                         (vreset! best i)))
-                     (if-let [i @best]
-                       (nth last-series i val/ERR-NA)
-                       val/ERR-NA)))))
+                         pos (approx-position (map-indexed vector search) target <=)]
+                     (if (val/err? pos) pos (nth last-series (dec (long (:v pos))) val/ERR-NA))))))
              :arity [2 3])
 
 ;; ---------------------------------------------------------------------------
@@ -375,18 +370,34 @@
               :c1 (max (:col l 0) (:col r 0))})
     nil))
 
+(defn- offset-area
+  "The area OFFSET gives for base `coords` and numbers `rows` `cols` `h` `w`
+   (`h`/`w` nil: the base's)."
+  [ctx coords rows cols h w]
+  (let [h  (or h (inc (- (long (:r1 coords)) (long (:r0 coords)))))
+        w  (or w (inc (- (long (:c1 coords)) (long (:c0 coords)))))
+        r0 (+ (long (:r0 coords)) (long rows))
+        c0 (+ (long (:c0 coords)) (long cols))
+        r1 (+ r0 (dec (long h)))
+        c1 (+ c0 (dec (long w)))]
+    (if (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
+      val/ERR-REF
+      (if-let [resolve-area (:resolve-area ctx)]
+        (resolve-area ctx {:sheet (:sheet coords) :r0 r0 :c0 c0 :r1 r1 :c1 c1})
+        val/ERR-REF))))
+
 (f/register! "OFFSET"
   ;; OFFSET(ref, rows, cols, [height], [width]) — shift the reference
   ;; by (rows, cols); optionally resize to (height, width). Height/width
   ;; default to the reference's own dimensions. Returns an area that
-  ;; the evaluator then resolves into values.
+  ;; the evaluator then resolves into values. With an array of rows, cols,
+  ;; heights or widths, an array of references (`f/refs?`), one per
+  ;; element, broadcast as arrays are.
              (fn [ctx ast-args]
                (let [ref-ast (first ast-args)
                      ;; an omitted argument (OFFSET(A1,0,0,,3)) is its default
                      given?  #(and (> (count ast-args) %) (not= :missing (:op (nth ast-args %))))
-                     num-at  #(if (given? %) (long (f/num! (eval1 ctx (nth ast-args %)))) 0)
-                     rows    (num-at 1)
-                     cols    (num-at 2)
+                     arg-at  #(when (given? %) (eval1 ctx (nth ast-args %)))
                      ;; the base may be computed (OFFSET(INDIRECT(…),…),
                      ;; OFFSET(INDEX(…),…)): a result that is a reference
                      coords  (or (ast->ref-coords ref-ast)
@@ -396,23 +407,33 @@
                                      {:sheet (:sheet v) :r0 (:r0 v) :c0 (:c0 v) :r1 (:r1 v) :c1 (:c1 v)}
                                      (:ref v)
                                      (let [{:keys [sheet row col]} (:ref v)]
-                                       {:sheet sheet :r0 row :c0 col :r1 row :c1 col}))))]
-                 (if-not coords
-                   val/ERR-VALUE
-                   (let [h-def (inc (- (long (:r1 coords)) (long (:r0 coords))))
-                         w-def (inc (- (long (:c1 coords)) (long (:c0 coords))))
-                         h     (if (given? 3) (num-at 3) h-def)
-                         w     (if (given? 4) (num-at 4) w-def)
-                         r0    (+ (long (:r0 coords)) rows)
-                         c0    (+ (long (:c0 coords)) cols)
-                         r1    (+ r0 (dec h))
-                         c1    (+ c0 (dec w))]
-                     (if (or (neg? r0) (neg? c0) (< r1 r0) (< c1 c0))
-                       val/ERR-REF
-                       (if-let [resolve-area (:resolve-area ctx)]
-                         (resolve-area ctx {:sheet (:sheet coords)
-                                            :r0 r0 :c0 c0 :r1 r1 :c1 c1})
-                         val/ERR-REF))))))
+                                       {:sheet sheet :r0 row :c0 col :r1 row :c1 col}))))
+                     ;; rows cols height width: numbers, nil when omitted, or arrays
+                     [rows cols h w :as ns] [(or (arg-at 1) (val/number 0)) (or (arg-at 2) (val/number 0)) (arg-at 3) (arg-at 4)]
+                     num (fn [v] (when (some? v) (long (f/num! v))))]
+                 (cond
+                   (not coords) val/ERR-VALUE
+                   (some f/area? ns)
+                   (let [arrays (filter f/area? ns)
+                         nr (reduce max (map #(count (:values %)) arrays))
+                         nc (reduce max (map #(count (first (:values %))) arrays))
+                         at (fn [v r c]
+                              (if (f/area? v)
+                                (let [g (:values v) row (nth g (if (= 1 (count g)) 0 r) nil)]
+                                  (nth row (if (= 1 (count row)) 0 c) nil))
+                                v))]
+                     {:t :refs
+                      :values (mapv (fn [r]
+                                      (mapv (fn [c]
+                                              (let [[a b hh ww] (map #(at % r c) ns)]
+                                                (if (and (some? a) (some? b) (or (nil? (nth ns 2)) (some? hh)) (or (nil? (nth ns 3)) (some? ww)))
+                                                  (try (offset-area ctx coords (num a) (num b) (num hh) (num ww))
+                                                       (catch #?(:clj Throwable :cljs :default) e
+                                                         (or (some-> (ex-data e) :excel-error val/error) val/ERR-VALUE)))
+                                                  val/ERR-NA)))
+                                            (range nc)))
+                                    (range nr))})
+                   :else (offset-area ctx coords (num rows) (num cols) (num h) (num w)))))
              :arity [3 5] :lazy? true :volatile? true)
 
 (f/register! "INDIRECT"

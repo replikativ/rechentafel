@@ -929,6 +929,19 @@
 
 (defn- ifs-positions [args] (vec (range 2 (count args) 2)))
 
+(defn- sized-like
+  "A SUMIF/AVERAGEIF sum range `sum` as Excel reads it beside the criteria
+   range `rng`: from its top-left cell, the size of `rng`, so
+   SUMIF(A1:E17,c,B1:B17) sums B1:F17."
+  [rng sum]
+  (let [dims (fn [v] (if (f/area? v) [(count (:values v)) (count (first (:values v)))] [1 1]))
+        [h w] (dims rng)
+        top (cond (and (f/area? sum) (:sheet sum)) {:sheet (:sheet sum) :r0 (long (:r0 sum)) :c0 (long (:c0 sum))}
+                  (:ref sum) (let [{:keys [sheet row col]} (:ref sum)] {:sheet sheet :r0 (long row) :c0 (long col)}))]
+    (if (and top f/*read-area* (not= [h w] (dims sum)))
+      (f/*read-area* (assoc top :r1 (+ (:r0 top) (dec h)) :c1 (+ (:c0 top) (dec w))))
+      sum)))
+
 (f/register! "SUMIF"
   ;; SUMIF(range, criterion, [sum_range])
              (with-criteria-array (constantly [1])
@@ -936,7 +949,7 @@
                  (let [range-cells (area-cells (nth args 0))
                        crit        (parse-criterion (nth args 1))
                        sum-cells   (if (> (count args) 2)
-                                     (area-cells (nth args 2))
+                                     (area-cells (sized-like (nth args 0) (nth args 2)))
                                      range-cells)
                        total (volatile! 0.0)]
                    (dotimes [i (count range-cells)]
@@ -970,7 +983,7 @@
                  (let [range-cells (area-cells (nth args 0))
                        crit        (parse-criterion (nth args 1))
                        avg-cells   (if (> (count args) 2)
-                                     (area-cells (nth args 2))
+                                     (area-cells (sized-like (nth args 0) (nth args 2)))
                                      range-cells)
                        total (volatile! 0.0)
                        n (volatile! 0)]

@@ -106,3 +106,74 @@
   (is (near? 9 (run [[0 0 "Apple pie"] [0 1 9]] "=VLOOKUP(\"App\"&\"*\",A1:B1,2,0)")) "VLOOKUP wildcards")
   (is (near? 14 (run [] "=SUM(10^{2;1;0}*SMALL({4;1;0},{1;2;3}))")) "SMALL with an array of k"))
 
+(deftest approximate-lookups-skip-other-types
+  (let [d [[0 0 5] [1 0 2] [2 0 9] [0 1 "a"] [1 1 "b"] [2 1 "c"]]]
+    (is (near? 3 (run d "=MATCH(2,1/(A1:A3>4))")) "errors are skipped: the last match")
+    (is (= "c" (run d "=LOOKUP(2,1/(A1:A3>4),B1:B3)")))
+    (is (near? 10 (run [[0 0 1] [1 0 "x"] [2 0 5] [0 1 10] [1 1 20] [2 1 30]] "=VLOOKUP(3,A1:B3,2)"))
+        "text among numbers is skipped")))
+
+(defn- recalc-cells [cells]
+  (e/recalc (reduce (fn [wb [r col v]] (e/set-cell wb (c/pack 0 r col) v)) (e/empty-workbook) cells)))
+
+(deftest a-whole-column-sees-the-formulas-in-it
+  (let [wb (recalc-cells [[0 1 5] [1 1 "=1+1"] [2 2 "=INDEX(B:B,2)"] [3 2 "=SUM(B:B)"]])]
+    (is (near? 2 (:v (e/get-cell wb (c/pack 0 2 2)))) "computed in the same recalc")
+    (is (near? 7 (:v (e/get-cell wb (c/pack 0 3 2)))))))
+
+(deftest references-that-are-not-reads-make-no-cycle
+  (let [wb (recalc-cells [[0 0 "=SUM(ROW($1:$3))"] [1 0 "=ROWS(A1:A3)+COLUMNS(A1:B1)"]])]
+    (is (near? 6 (:v (e/get-cell wb (c/pack 0 0 0)))) "ROW of rows the formula is in")
+    (is (near? 5 (:v (e/get-cell wb (c/pack 0 1 0))))))
+  (let [wb (recalc-cells [[0 1 5] [1 1 "=INDEX(B:B,1)+1"] [2 1 "=MAX(B$1:B2)+INDEX(B:B,2)"]])]
+    (is (near? 6 (:v (e/get-cell wb (c/pack 0 1 1)))) "INDEX over its own column reads one cell")
+    (is (near? 12 (:v (e/get-cell wb (c/pack 0 2 1))))))
+  (let [wb (recalc-cells [[0 0 "=B1+1"] [0 1 "=A1+1"]])]
+    (is (= :ref (:v (e/get-cell wb (c/pack 0 0 0)))) "a circular reference")
+    (is (= :ref (:v (e/get-cell wb (c/pack 0 0 1)))))))
+
+(def ^:private g3 [[0 0 1] [1 0 2] [2 0 3] [0 1 10] [1 1 20] [2 1 30] [0 2 100] [1 2 200] [2 2 300]])
+
+(deftest offset-with-arrays-is-an-array-of-references
+  (is (near? 666 (run g3 "=SUMPRODUCT(SUBTOTAL(9,OFFSET(A1:A3,,{0,1,2})))")) "one total per column")
+  (is (near? 333 (run g3 "=SUM(SUBTOTAL(4,OFFSET(A1:A3,,ROW($1:$3)-1,)))")))
+  (is (near? 6 (run g3 "=SUMPRODUCT(N(OFFSET(A1,{0,1,2},0)))")))
+  (is (near? 550 (run g3 "=SUM(SUMIF(A1:A3,\">1\",OFFSET(A1:A3,,{1,2})))")))
+  (is (= :value (run g3 "=OFFSET(A1,{0,1},0)")) "not a value a cell can hold"))
+
+(deftest a-smaller-sum-range-takes-the-size-of-the-range
+  (is (near? 650 (run g3 "=SUMIF(A1:B3,\">1\",B1:B1)")) "B1:C3")
+  (is (near? 25 (run g3 "=AVERAGEIF(A1:A3,\">1\",B1:B2)")) "B1:B3"))
+
+(deftest offset-and-indirect-on-the-formulas-sheet
+  (let [wb (-> (e/empty-workbook ["S1" "S2"])
+               (e/set-cell (c/pack 1 0 0) 7)
+               (e/set-cell (c/pack 1 1 1) "=OFFSET(A1,0,0)+INDIRECT(\"A1\")")
+               e/recalc)]
+    (is (near? 14 (:v (e/get-cell wb (c/pack 1 1 1)))))))
+
+(deftest text-as-a-number
+  (doseq [[f want] [["=\"1,000\"+0" 1000] ["=\"50%\"+0" 0.5] ["=\"$5\"*2" 10] ["=\" 7 \"+0" 7] ["=\"-1.5e2\"+0" -150]]]
+    (is (near? want (run [] f)) f))
+  (doseq [f ["=\"1d\"+0" "=\"NaN\"+0" "=\"12abc\"+0"]]
+    (is (= :value (run [] f)) f)))
+
+(deftest typographic-quotes-are-a-name
+  (is (near? 1 (run [] "=IFERROR(1,“”)")))
+  (is (= :name (run [] "=IFERROR(1/0,“”)"))))
+
+(deftest external-books-as-cached
+  (let [wb (-> (e/empty-workbook ["Main"])
+               (e/define-external-sheet "1" "May 2021" [[0 0 {:t :str :v "k"}] [0 1 {:t :num :v 4.0}] [1 1 {:t :num :v 6.0}]])
+               (e/set-cell (c/pack 0 0 0) "='[1]May 2021'!B1")
+               (e/set-cell (c/pack 0 1 0) "=SUM([1]'May 2021'!B:B)")
+               (e/set-cell (c/pack 0 2 0) "=VLOOKUP(\"k\",'[1]May 2021'!A:B,2,0)")
+               (e/set-cell (c/pack 0 3 0) "=[2]Other!A1")
+               (e/set-cell (c/pack 0 4 0) "=SHEETS()")
+               e/recalc)
+        v #(:v (e/get-cell wb (c/pack 0 % 0)))]
+    (is (near? 4 (v 0)) "the book inside the quotes")
+    (is (near? 10 (v 1)))
+    (is (near? 4 (v 2)))
+    (is (= :ref (v 3)) "a book the file does not cache")
+    (is (near? 1 (v 4)) "not one of the workbook's sheets")))

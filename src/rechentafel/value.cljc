@@ -78,9 +78,20 @@
 ;;   string → parse as number when coerced to number; error if not parsable
 ;;   error  → propagates
 
-(defn- parse-number [s]
-  #?(:clj  (try (Double/parseDouble s) (catch Exception _ nil))
-     :cljs (let [n (js/parseFloat s)] (when-not (js/isNaN n) n))))
+(defn- parse-number
+  "The number text `s` is, as Excel reads text as a number (VALUE, and text
+   in arithmetic): a sign, a $, digits with or without thousands commas, a
+   fraction, an exponent, a trailing %; nil for anything else (\"1d\",
+   \"NaN\" and a numeric prefix such as \"1Oct\" are not numbers)."
+  [s]
+  (when-let [[_ sign dollar int-part frac exp pct]
+             (re-matches #"\s*([+-]?)\s*(\$?)\s*(\d{1,3}(?:,\d{3})+|\d*)(\.\d*)?([eE][+-]?\d+)?\s*(%?)\s*" s)]
+    (when (or (seq int-part) (and frac (> (count frac) 1)))
+      (let [digits (str (str/replace int-part "," "") (or frac "") (or exp ""))
+            digits (if (str/starts-with? digits ".") (str "0" digits) digits)
+            n #?(:clj (Double/parseDouble digits) :cljs (js/parseFloat digits))
+            n (if (= "-" sign) (- n) n)]
+        (if (seq pct) (/ n 100.0) n)))))
 
 (defn first-cell-of
   "Returns the scalar at row 0 col 0 of an Area value, or BLANK if empty."

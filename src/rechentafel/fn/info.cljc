@@ -317,7 +317,7 @@
              (fn [ctx ast-args]
                (let [wb (:wb ctx)]
                  (if (empty? ast-args)
-                   (val/number (double (count (:sheets wb))))
+                   (val/number (double (count (:sheet-names wb))))
                    (let [a (first ast-args)]
                      (cond
             ;; 3D range like Sheet1:Sheet3!A1

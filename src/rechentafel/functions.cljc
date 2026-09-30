@@ -119,6 +119,30 @@
 
 (declare lift-call area?)
 
+(defn refs?
+  "An array of references (OFFSET(A1:A9,,{1,2,3}) is three columns): the
+   areas in `:values`, a grid like an area's."
+  [v]
+  (= :refs (:t v)))
+
+(declare call)
+
+(defn- call-per-ref
+  "`fname` applied once per reference of the `:refs` arguments (the others
+   as they are), as Excel does: SUBTOTAL(9,OFFSET(B1:B9,,{0,1})) is one
+   total per column. `:refs` of different sizes broadcast as arrays do."
+  [fname args]
+  (let [rs (filter refs? args)
+        nr (reduce max (map #(count (:values %)) rs))
+        nc (reduce max (map #(count (first (:values %))) rs))
+        at (fn [v r c] (let [g (:values v)
+                             row (nth g (if (= 1 (count g)) 0 r) nil)]
+                         (or (nth row (if (= 1 (count row)) 0 c) nil) val/ERR-NA)))]
+    {:t :area :r0 0 :c0 0 :r1 (dec nr) :c1 (dec nc)
+     :values (mapv (fn [r] (mapv (fn [c] (call fname (mapv #(if (refs? %) (at % r c) %) args)))
+                                 (range nc)))
+                   (range nr))}))
+
 (defn call
   "Invoke the registered fn with `args` (already-evaluated values). Returns
   a value — either the fn's result or an Excel error. If the fn is not
@@ -132,6 +156,7 @@
   (if-let [{f :fn arity :arity lift? :lift?} (lookup fname)]
     (cond
       (not (arity-ok? arity (count args))) val/ERR-VALUE
+      (some refs? args) (call-per-ref fname args)
       :else
       (or (first-error args)
           (try
@@ -186,6 +211,12 @@
 ;; to (0,0) of the area.
 
 (def ^:dynamic *current-cell* nil)
+
+(def ^:dynamic *read-area*
+  "While a formula is evaluated, a fn of {:sheet name :r0 :c0 :r1 :c1}: that
+   range of the workbook, for a function that reads past an argument (a
+   smaller SUMIF sum_range takes the size of its range)."
+  nil)
 
 (defn implicit-intersect
   "Project an :area value to a scalar using *current-cell*. Non-areas
