@@ -98,7 +98,12 @@
     ;; an :area; sibling cells in [r0..r1, c0..c1] hold the
     ;; element values directly in :sheets, no separate :formulas
     ;; entry. The `A1#` operator reads :spills to find the live shape.
-    :spills      {}}))
+    :spills      {}
+    ;; Legacy (Ctrl+Shift+Enter) array formulas: anchor-id → {:r1 :c1}, the
+    ;; fixed rectangle the file assigned (anchor at its top-left). Unlike a
+    ;; spill it never grows or blocks: recalc fills exactly the rectangle
+    ;; (`array-range-value`), and reading any of its cells reads the anchor.
+    :array-ranges {}}))
 
 (defn define-table
   "Register an Excel table (ListObject) on the workbook.
@@ -884,6 +889,8 @@
                       (get (:reads wb) fid)))
               candidates))))
 
+(declare array-rect)
+
 (defn- transitive-dirty
   "Starting from `seed` cells, walk the reverse-dependency graph and
   return every formula-id whose transitive inputs include a seed cell."
@@ -892,7 +899,13 @@
     (if (empty? stack)
       dirty
       (let [cid (peek stack)
-            readers (formulas-reading-cell wb cid)
+            readers (concat (formulas-reading-cell wb cid)
+                            ;; an array anchor writes its whole rectangle
+                            (when-let [{:keys [sheet r0 c0 r1 c1]} (array-rect wb cid)]
+                              (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))
+                                    :let [id (cell/pack sheet r c)] :when (not= id cid)
+                                    f (formulas-reading-cell wb id)]
+                                f)))
             fresh   (reduce (fn [acc f]
                               (if (contains? dirty f) acc (conj acc f)))
                             [] readers)]
@@ -1044,6 +1057,29 @@
   (* (inc (- (long r1) (long r0)))
      (inc (- (long c1) (long c0)))))
 
+(defn- array-rect
+  "The rectangle of legacy array anchor `id` as a range, or nil."
+  [wb ^long id]
+  (when-let [{:keys [r1 c1]} (get (:array-ranges wb) id)]
+    {:sheet (cell/sheet id) :r0 (cell/row id) :c0 (cell/col id) :r1 r1 :c1 c1}))
+
+(defn- ranges-intersect? [a b]
+  (and (= (long (:sheet a)) (long (:sheet b)))
+       (<= (long (:r0 a)) (long (:r1 b))) (<= (long (:r0 b)) (long (:r1 a)))
+       (<= (long (:c0 a)) (long (:c1 b))) (<= (long (:c0 b)) (long (:c1 a)))))
+
+(defn- array-anchors-read
+  "Legacy array anchors in `node-set` whose rectangle one of
+   `formula-id`'s reads touches: the anchor writes those cells."
+  [wb formula-id node-set]
+  (when (seq (:array-ranges wb))
+    (let [reads (get (:reads wb) formula-id)]
+      (for [[anchor _] (:array-ranges wb)
+            :when (and (not= (long anchor) (long formula-id)) (contains? node-set anchor))
+            :let [rect (array-rect wb anchor)]
+            :when (some #(ranges-intersect? % rect) reads)]
+        anchor))))
+
 (defn- predecessors-in-nodes
   "Formulas inside `node-set` that `formula-id` depends on — i.e. nodes
   whose owner-cell lies inside one of `formula-id`'s read-ranges. Picks
@@ -1096,7 +1132,8 @@
   [wb nodes]
   (let [node-set (set nodes)
         in-deps  (into {} (for [n nodes]
-                            [n (vec (predecessors-in-nodes wb n node-set))]))
+                            [n (vec (distinct (concat (predecessors-in-nodes wb n node-set)
+                                                      (array-anchors-read wb n node-set))))]))
         in-count (into {} (for [[n ds] in-deps] [n (count ds)]))
         rev      (reduce-kv (fn [acc n ds]
                               (reduce (fn [a d] (update a d (fnil conj []) n))
@@ -1253,6 +1290,29 @@
             [pending wb'] (materialise-spill wb pending anchor-id area)]
         [pending wb']))))
 
+(defn array-range-value
+  "The value at row `i`, column `j` of a legacy array range whose formula
+   gave `v`, as Excel fills it: a single value in every cell; a one-row
+   (one-column) result repeated down (across); outside the result #N/A."
+  [v i j]
+  (if (not= :area (:t v))
+    v
+    (let [vals (:values v)
+          vr (count vals)
+          vc (count (first vals))
+          i' (if (= 1 vr) 0 (long i))
+          j' (if (= 1 vc) 0 (long j))]
+      (if (and (< i' vr) (< j' vc))
+        (get-in vals [i' j'] val/BLANK)
+        val/ERR-NA))))
+
+(defn- fill-array-range [wb pending ^long anchor v]
+  (let [{:keys [sheet r0 c0 r1 c1]} (array-rect wb anchor)]
+    (reduce (fn [pending [r c]]
+              (assoc! pending (cell/pack sheet r c) (array-range-value v (- (long r) (long r0)) (- (long c) (long c0)))))
+            pending
+            (for [r (range r0 (inc (long r1))) c (range c0 (inc (long c1)))] [r c]))))
+
 (declare recalc-impl)
 
 (defn recalc
@@ -1308,6 +1368,9 @@
                               (get-in (:values v) [0 0] val/BLANK)
                               v)]
                       (cond
+                        (contains? (:array-ranges wb) id)
+                        [(fill-array-range wb pending id v) wb]
+
                         (= :area (:t v))
                         (handle-spill wb pending id v)
 
@@ -1324,6 +1387,16 @@
         pending  (reduce #(assoc! %1 %2 val/ERR-REF) pending cycle)
         sheets   (flush-pending (:sheets wb) (persistent! pending))]
     (assoc wb :sheets sheets :dirty #{})))
+
+(defn set-array-formula
+  "Set a legacy (Ctrl+Shift+Enter) array formula: `input` at `anchor-id`,
+   filling the fixed rectangle from it down to row `r1`, column `c1` (same
+   sheet) — see `array-range-value`. A 1x1 rectangle shows the top-left
+   value of an array result, and never spills."
+  [wb anchor-id input r1 c1]
+  (-> wb
+      (assoc-in [:array-ranges anchor-id] {:r1 (long r1) :c1 (long c1)})
+      (set-cell anchor-id input)))
 
 ;; ---------------------------------------------------------------------------
 ;; Convenience

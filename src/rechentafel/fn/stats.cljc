@@ -843,10 +843,37 @@
         (vswap! n inc)))
     @n))
 
+(defn- multi-cell-area? [v]
+  (and (f/area? v) (or (not= (long (:r0 v)) (long (:r1 v))) (not= (long (:c0 v)) (long (:c1 v))))))
+
+(defn- one-cell [v] (if (f/area? v) (get-in (:values v) [0 0] val/BLANK) v))
+
+(defn- per-criterion
+  "An array of criteria gives an array of results: `f` of the criteria at
+   each position, in the shape of the criteria (a one-row or one-column
+   criterion broadcast, a single one repeated), as Excel lifts COUNTIF."
+  [crits f]
+  (if-not (some multi-cell-area? crits)
+    (f (mapv one-cell crits))
+    (let [areas (filter multi-cell-area? crits)
+          rows (apply max (map #(inc (- (long (:r1 %)) (long (:r0 %)))) areas))
+          cols (apply max (map #(inc (- (long (:c1 %)) (long (:c0 %)))) areas))
+          at (fn [c i j]
+               (if (multi-cell-area? c)
+                 (let [vs (:values c)
+                       i' (if (= 1 (count vs)) 0 i)
+                       j' (if (= 1 (count (first vs))) 0 j)]
+                   (get-in vs [i' j'] val/ERR-NA))
+                 (one-cell c)))]
+      {:t :area :r0 0 :c0 0 :r1 (dec rows) :c1 (dec cols)
+       :values (vec (for [i (range rows)]
+                      (vec (for [j (range cols)] (f (mapv #(at % i j) crits))))))})))
+
 (f/register! "COUNTIF"
              (fn [args]
-               (val/number (double (count-if-over (area-cells (nth args 0))
-                                                  (nth args 1)))))
+               (let [cells (area-cells (nth args 0))]
+                 (per-criterion [(nth args 1)]
+                                (fn [[crit]] (val/number (double (count-if-over cells crit)))))))
              :arity [2 2])
 
 (defn- ifs-indices
@@ -869,7 +896,10 @@
 (f/register! "COUNTIFS"
              (fn [args]
                (when (odd? (count args)) (f/domain-error! :value))
-               (val/number (double (count (ifs-indices (partition 2 args))))))
+               (let [pairs (partition 2 args)
+                     ranges (mapv first pairs)]
+                 (per-criterion (mapv second pairs)
+                                (fn [crits] (val/number (double (count (ifs-indices (map vector ranges crits)))))))))
              :arity [2 nil])
 
 (defn- numeric-at [cells i]
