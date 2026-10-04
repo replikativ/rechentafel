@@ -82,9 +82,15 @@
                                                  (not (dynamic-array? c)))
                                         (.getArrayFormulaRange c))]
                               (if (nil? input) wb
-                                  (try (if arr
-                                         (e/set-array-formula wb id input (.getLastRow arr) (.getLastColumn arr))
-                                         (e/set-cell wb id input))
+                                  (try (cond
+                                         arr (e/set-array-formula wb id input (.getLastRow arr) (.getLastColumn arr))
+                                         ;; a formula the file does not mark as a
+                                         ;; dynamic array is a legacy formula: it
+                                         ;; never spills over the cells below
+                                         (and (string? input) (clojure.string/starts-with? input "=")
+                                              (not (dynamic-array? c)))
+                                         (e/set-legacy-formula wb id input)
+                                         :else (e/set-cell wb id input))
                                        ;; one formula we cannot parse is that
                                        ;; cell's #NAME? (as Excel shows a formula
                                        ;; it cannot read), not a failed workbook;

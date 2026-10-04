@@ -114,7 +114,23 @@
     ;; fixed rectangle the file assigned (anchor at its top-left). Unlike a
     ;; spill it never grows or blocks: recalc fills exactly the rectangle
     ;; (`array-range-value`), and reading any of its cells reads the anchor.
-    :array-ranges {}}))
+    :array-ranges {}
+    ;; Legacy formulas read from a file (no dynamic-array metadata): their
+    ;; value is a scalar, as in the Excel that wrote them. An array result
+    ;; is reduced by implicit intersection, never spilled (a spill would
+    ;; overwrite the cells below, which the file says hold other values).
+    ;; Writing the cell again clears the mark.
+    :legacy #{}}))
+
+(declare set-cell)
+
+(defn set-legacy-formula
+  "Set formula `input` at `id` as a legacy formula of a file: like
+   `set-cell`, but an array result is intersected to a scalar instead of
+   spilling (`:legacy`)."
+  [wb ^long id input]
+  (-> (set-cell wb id input)
+      (update :legacy (fnil conj #{}) id)))
 
 (defn define-table
   "Register an Excel table (ListObject) on the workbook.
@@ -1079,7 +1095,8 @@
   Returns an updated workbook with this cell (and its transitive
   downstream) marked dirty."
   [wb ^long id input]
-  (let [[ast literal-v]
+  (let [wb (cond-> wb (contains? (:legacy wb) id) (update :legacy disj id))
+        [ast literal-v]
         (cond
           (and (map? input) (:op input)) [input nil]
           (and (map? input) (:t input))  [nil input]
@@ -1522,9 +1539,15 @@
 
 (defn- write-result
   "`[pending wb]` with formula `id`'s value `v` written: a legacy array
-   range fills, an area spills, a scalar clears a prior spill."
+   range fills, an area spills (a legacy formula's is intersected to a
+   scalar), a scalar clears a prior spill."
   [[pending wb] ^long id v]
   (cond
+    (and (= :area (:t v)) (contains? (:legacy wb) id))
+    (let [v (binding [functions/*current-cell* {:sheet (cell/sheet id) :row (cell/row id) :col (cell/col id)}]
+              (functions/implicit-intersect v))]
+      (write-result [pending wb] id (if (= :area (:t v)) val/ERR-VALUE v)))
+
     (contains? (:array-ranges wb) id)
     [(fill-array-range wb pending id v) wb]
 
