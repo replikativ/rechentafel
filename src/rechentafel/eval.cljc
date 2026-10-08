@@ -98,6 +98,9 @@
     :sector-rdeps {}
     :dirty       #{}
     :volatile    #{}
+    ;; formulas building references at run time (INDIRECT / OFFSET):
+    ;; recalc computes them, and what reads them, on demand
+    :dynamic     #{}
     ;; Excel tables (ListObjects). Keyed case-insensitively. Each
     ;; entry's :ref is the full extent including header and totals
     ;; rows; :header-rows and :totals-rows tell the resolver how to
@@ -198,30 +201,44 @@
       [wb existing]
       [(assoc-in wb [:shared-asts h] rc-ast) rc-ast])))
 
+(defn- ast-has?
+  "Whether `node?` holds for a node of `ast` (calls, :spill-ref) or below."
+  [node? ast]
+  (let [has? (partial ast-has? node?)]
+    (case (:op ast)
+      :call    (or (boolean (node? ast)) (boolean (some has? (:args ast))))
+      :binop   (or (has? (:left ast)) (has? (:right ast)))
+      :unop    (has? (:arg ast))
+      :postop  (has? (:arg ast))
+      :union   (boolean (some has? (:args ast)))
+      :intersect (or (has? (:left ast)) (has? (:right ast)))
+      :array   (boolean (some (fn [row] (some has? row)) (:rows ast)))
+      :single-cell (has? (:arg ast))
+      :spill-ref   (boolean (node? ast))
+      :let     (or (boolean (some (fn [[_ v]] (has? v)) (:bindings ast)))
+                   (has? (:body ast)))
+      :lambda  (has? (:body ast))
+      :lambda-call (or (has? (:fn ast)) (boolean (some has? (:args ast))))
+      false)))
+
 (defn- ast-has-volatile?
   "Walks an AST looking for any :call whose target is registered as volatile.
-  Also flags :range with whole-col/row refs since those are handled through
-  dynamic-range fns (OFFSET/INDIRECT). Called at formula install time."
+  A spill reference reads a live shape, so it counts too. Called at formula
+  install time."
   [ast]
-  (case (:op ast)
-    :call    (or (some-> (:name ast) functions/lookup :volatile? boolean)
-                 (boolean (some ast-has-volatile? (:args ast))))
-    :binop   (or (ast-has-volatile? (:left ast))
-                 (ast-has-volatile? (:right ast)))
-    :unop    (ast-has-volatile? (:arg ast))
-    :postop  (ast-has-volatile? (:arg ast))
-    :union   (boolean (some ast-has-volatile? (:args ast)))
-    :intersect (or (ast-has-volatile? (:left ast))
-                   (ast-has-volatile? (:right ast)))
-    :array   (boolean (some (fn [row] (some ast-has-volatile? row)) (:rows ast)))
-    :single-cell (ast-has-volatile? (:arg ast))
-    :spill-ref   true                  ;; live-shape lookup is volatile-ish
-    :let     (or (boolean (some (fn [[_ v]] (ast-has-volatile? v)) (:bindings ast)))
-                 (ast-has-volatile? (:body ast)))
-    :lambda  (ast-has-volatile? (:body ast))
-    :lambda-call (or (ast-has-volatile? (:fn ast))
-                     (boolean (some ast-has-volatile? (:args ast))))
-    false))
+  (ast-has? (fn [node] (case (:op node)
+                         :call (some-> (:name node) functions/lookup :volatile?)
+                         :spill-ref true
+                         false))
+            ast))
+
+(defn- ast-has-dynamic-ref?
+  "Whether the AST builds a reference at run time (INDIRECT, OFFSET): the
+  cells it reads are not in the dependency graph."
+  [ast]
+  (ast-has? (fn [node] (and (= :call (:op node))
+                            (contains? #{"INDIRECT" "OFFSET"} (str/upper-case (str (:name node))))))
+            ast))
 
 (defn- sheet-index
   "The index of the sheet named `n` (as Excel, ignoring case), or nil."
@@ -1130,6 +1147,7 @@
                                   {:sheet (cell/sheet id) :row row :col col}]
                           (collect-reads wb live-ast))
               vol?     (ast-has-volatile? interned)
+              dyn?     (ast-has-dynamic-ref? interned)
               wb      (-> wb
                           (remove-reads id)
                           (add-reads id new-reads)
@@ -1139,6 +1157,7 @@
                           (update-in [:formula-extent (cell/sheet id)]
                                      (fn [[mr mc]] [(max (long (or mr 0)) (long row)) (max (long (or mc 0)) (long col))]))
                           (update :volatile (if vol? #(conj % id) #(disj % id)))
+                          (update :dynamic (fnil (if dyn? #(conj % id) #(disj % id)) #{}))
                           (update :dirty
                                   (fn [d] (-> d (conj id)
                                               (into touched-anchors)
@@ -1148,6 +1167,7 @@
             (remove-reads id)
             (update :formulas dissoc id)
             (update :volatile disj id)
+            (update :dynamic (fnil disj #{}) id)
             (put-cell-value id literal-v)
             (update :dirty
                     (fn [d] (-> (disj d id)
@@ -1612,7 +1632,15 @@
                              (into seeded (transitive-dirty wb (:volatile wb))))))
                  wb)
         nodes  (vec (dirty-formulas wb))
-        {:keys [order cycle]} (topo-order wb nodes)
+        ;; A formula building its references at run time may read any
+        ;; cell, so the static order cannot place it (a running total
+        ;; through INDIRECT("H"&ROW()-1) read the cell above before it was
+        ;; computed). It computes on demand, with what reads it; the rest
+        ;; never reads into that set, so the static order holds for it.
+        dynamic (let [d (filterv #(contains? (:dynamic wb) %) nodes)]
+                  (when (seq d) (into (set d) (filter (set nodes)) (transitive-dirty wb d))))
+        {:keys [order cycle]} (topo-order wb (if dynamic (into [] (remove dynamic) nodes) nodes))
+        cycle  (into cycle dynamic)
         written (into #{} (map #(long (cell/sheet %))) nodes)
         cache {:stable (into #{} (remove written) (range (count (:sheets wb)))) :cache (volatile! {})}
         ;; Two-phase recalc:

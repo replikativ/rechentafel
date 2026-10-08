@@ -238,3 +238,20 @@
     (is (= [:blank :blank "998" "999"] (mapv #(let [v (rechentafel.mtv/col-get col %)] (if (= :blank (:t v)) :blank (:v v))) [0 997 998 999])))
     (is (<= (count (:blocks col)) 2) "the blanks are one block, the rest a view of the old run")
     (is (= "500" (:v (rechentafel.mtv/col-get full 500))) "the old column is unchanged")))
+
+(deftest a-running-total-through-indirect-reads-the-row-above-computed
+  ;; each cell reads the one above it only through INDIRECT, which the
+  ;; dependency graph cannot see; the column was computed out of order
+  (let [rows 40
+        wb (reduce (fn [wb r] (-> wb (e/set-cell (c/pack 0 r 1) (* 10 r)) (e/set-cell (c/pack 0 r 2) 0.1)))
+                   (e/empty-workbook) (range 1 rows))
+        wb (reduce (fn [wb r]
+                     (e/set-cell wb (c/pack 0 r 7)
+                                 "=(IF(ROW()=2,0,INDIRECT(\"H\"&ROW()-1))+INDIRECT(\"B\"&ROW()))*(1+INDIRECT(\"C\"&ROW()))"))
+                   wb (range 1 rows))
+        wb (e/recalc wb)
+        expected (reductions (fn [acc r] (* (+ acc (* 10 r)) 1.1)) 11.0 (range 2 rows))]
+    (is (every? true? (map near? expected (map #(:v (e/get-cell wb (c/pack 0 % 7))) (range 1 rows)))))
+    (testing "and a cell reading the column statically sees the final values"
+      (let [wb (e/recalc (e/set-cell wb (c/pack 0 0 9) "=SUM(H2:H40)"))]
+        (is (near? (reduce + expected) (:v (e/get-cell wb (c/pack 0 0 9)))))))))
